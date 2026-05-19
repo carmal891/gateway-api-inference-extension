@@ -18,6 +18,7 @@ package bbr
 
 import (
 	"encoding/json"
+	"strconv"
 
 	envoyCorev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
@@ -26,7 +27,8 @@ import (
 // --- Response Expectations (Streaming) ---
 
 // ExpectBBRHeader asserts that BBR set the specific model header and cleared the route cache.
-func ExpectBBRHeader(modelName string) *extProcPb.ProcessingResponse {
+// baseModelName is the expected base model name (e.g., "qwen" for both "qwen" and "sql-lora-sheddable")
+func ExpectBBRHeader(modelName, baseModelName string, contentLength string) *extProcPb.ProcessingResponse {
 	return &extProcPb.ProcessingResponse{
 		Response: &extProcPb.ProcessingResponse_RequestHeaders{
 			RequestHeaders: &extProcPb.HeadersResponse{
@@ -36,14 +38,20 @@ func ExpectBBRHeader(modelName string) *extProcPb.ProcessingResponse {
 						SetHeaders: []*envoyCorev3.HeaderValueOption{
 							{
 								Header: &envoyCorev3.HeaderValue{
-									Key:      "X-Gateway-Model-Name",
-									RawValue: []byte(modelName),
+									Key:      "Content-Length",
+									RawValue: []byte(contentLength),
 								},
 							},
 							{
 								Header: &envoyCorev3.HeaderValue{
 									Key:      "X-Gateway-Base-Model-Name",
-									RawValue: []byte(""),
+									RawValue: []byte(baseModelName),
+								},
+							},
+							{
+								Header: &envoyCorev3.HeaderValue{
+									Key:      "X-Gateway-Model-Name",
+									RawValue: []byte(modelName),
 								},
 							},
 						},
@@ -83,22 +91,64 @@ func ExpectBBRBodyPassThrough(prompt, model string) *extProcPb.ProcessingRespons
 	}
 }
 
-// ExpectBBRNoOpHeader asserts that BBR did nothing to the headers (e.g., when no model is found).
-func ExpectBBRNoOpHeader() *extProcPb.ProcessingResponse {
+// --- Response Phase Expectations ---
+
+// ExpectResponseHeadersPassThrough asserts that BBR passed response headers through with no mutations.
+func ExpectResponseHeadersPassThrough() *extProcPb.ProcessingResponse {
 	return &extProcPb.ProcessingResponse{
-		Response: &extProcPb.ProcessingResponse_RequestHeaders{
-			RequestHeaders: &extProcPb.HeadersResponse{},
+		Response: &extProcPb.ProcessingResponse_ResponseHeaders{
+			ResponseHeaders: &extProcPb.HeadersResponse{},
 		},
 	}
 }
 
-// --- Response Expectations (Unary) ---
+// ExpectResponseBodyPassThrough asserts that BBR passed the response body through with no mutations
+// (i.e., no response plugins configured).
+func ExpectResponseBodyPassThrough() *extProcPb.ProcessingResponse {
+	return &extProcPb.ProcessingResponse{
+		Response: &extProcPb.ProcessingResponse_ResponseBody{
+			ResponseBody: &extProcPb.BodyResponse{},
+		},
+	}
+}
+
+// ExpectResponseBodyMutation asserts that a response plugin mutated the response body (unary mode).
+// Includes the Content-Length header mutation.
+func ExpectResponseBodyMutation(body map[string]any) *extProcPb.ProcessingResponse {
+	b, _ := json.Marshal(body)
+	return &extProcPb.ProcessingResponse{
+		Response: &extProcPb.ProcessingResponse_ResponseBody{
+			ResponseBody: &extProcPb.BodyResponse{
+				Response: &extProcPb.CommonResponse{
+					ClearRouteCache: true,
+					HeaderMutation: &extProcPb.HeaderMutation{
+						SetHeaders: []*envoyCorev3.HeaderValueOption{
+							{
+								Header: &envoyCorev3.HeaderValue{
+									Key:      "Content-Length",
+									RawValue: []byte(strconv.Itoa(len(b))),
+								},
+							},
+						},
+					},
+					BodyMutation: &extProcPb.BodyMutation{
+						Mutation: &extProcPb.BodyMutation_Body{
+							Body: b,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// --- Request Phase Expectations (Unary) ---
 
 // ExpectBBRUnaryResponse creates expected response for unary tests where the body is mutated directly.
-func ExpectBBRUnaryResponse(modelName string) *extProcPb.ProcessingResponse {
+// baseModelName is the expected base model name (e.g., "qwen" for both "qwen" and "sql-lora-sheddable")
+func ExpectBBRUnaryResponse(modelName, baseModelName string) *extProcPb.ProcessingResponse {
 	resp := &extProcPb.ProcessingResponse{}
 
-	// If modelName is present, we expect header mutations.
 	if modelName != "" {
 		resp.Response = &extProcPb.ProcessingResponse_RequestBody{
 			RequestBody: &extProcPb.BodyResponse{
@@ -115,7 +165,7 @@ func ExpectBBRUnaryResponse(modelName string) *extProcPb.ProcessingResponse {
 							{
 								Header: &envoyCorev3.HeaderValue{
 									Key:      "X-Gateway-Base-Model-Name",
-									RawValue: []byte(""),
+									RawValue: []byte(baseModelName),
 								},
 							},
 						},
@@ -124,7 +174,6 @@ func ExpectBBRUnaryResponse(modelName string) *extProcPb.ProcessingResponse {
 			},
 		}
 	} else {
-		// Otherwise, expect a No-Op on the body.
 		resp.Response = &extProcPb.ProcessingResponse_RequestBody{
 			RequestBody: &extProcPb.BodyResponse{},
 		}

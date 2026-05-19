@@ -5,11 +5,11 @@ aliases:
   gateway-api-inference-extension-maintainers:
   - ahg-g
   - danehans
+  - elevran
   - nirrozenbaum
   - kfswain
 
   gateway-api-inference-extension-reviewers:
-  - elevran
   - liu-cong
   - robscott
   - shmuelk

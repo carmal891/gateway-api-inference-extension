@@ -71,7 +71,7 @@ This document defines the process for releasing Gateway API Inference Extension.
      git checkout -b release-${MAJOR}.${MINOR} ${REMOTE}/release-${MAJOR}.${MINOR}
      ```
 
-4. Update release-specific content, generate release artifacts, and stage the changes.
+4. Update release-specific content, generate release artifacts, pin the `conformance` module to the matching root-module version, and stage the changes.
 
    ```shell
    make release
@@ -97,47 +97,47 @@ This document defines the process for releasing Gateway API Inference Extension.
     git push ${REMOTE} release-${MAJOR}.${MINOR}
     ```
 
-7. Tag the head of your release branch with the number.
+7. Create and push signed tags for the repo and the `conformance` module.
 
-   For a release candidate:
+   ```shell
+   make release-tags
+   ```
 
-    ```shell
-    git tag -s -a v${MAJOR}.${MINOR}.${PATCH}-rc.${RC} -m 'Gateway API Inference Extension v${MAJOR}.${MINOR}.${PATCH}-rc.${RC} Release Candidate'
-    ```
-
-   For a major, minor or patch release:
-
-    ```shell
-    git tag -s -a v${MAJOR}.${MINOR}.${PATCH} -m 'Gateway API Inference Extension v${MAJOR}.${MINOR}.${PATCH} Release'
-    ```
+   This creates and pushes the following tags together:
+   - `v${MAJOR}.${MINOR}.${PATCH}` or `v${MAJOR}.${MINOR}.${PATCH}-rc.${RC}`
+   - `conformance/v${MAJOR}.${MINOR}.${PATCH}` or `conformance/v${MAJOR}.${MINOR}.${PATCH}-rc.${RC}`
 
    **Note:** A PGP key must be [registered] to your GitHub account.
 
-8. Push the tag to the Gateway API Inference Extension repo.
-
-   For a release candidate:
-
-    ```shell
-    git push ${REMOTE} v${MAJOR}.${MINOR}.${PATCH}-rc.${RC}
-    ```
-
-   For a major, minor or patch release:
-
-    ```shell
-    git push ${REMOTE} v${MAJOR}.${MINOR}.${PATCH}
-    ```
-
-9. Pushing the tag triggers Prow to build and publish the container image to the [staging registry][].
-10. Submit a PR against [k8s.io][] to add the staging image tag and SHA to [`k8s-staging-gateway-api-inference-extension/images.yaml`][yaml]. This will
+8. Pushing the root tag triggers Prow to build and publish the container image to the [staging registry][].
+9. Submit a PR against [k8s.io][] to add the staging image tag and SHA to [`k8s-staging-gateway-api-inference-extension/images.yaml`][yaml]. This will
     promote the image to the production registry, e.g. `registry.k8s.io/gateway-api-inference-extension/epp:v${MAJOR}.${MINOR}.${PATCH}`.
+    1. Collect release digests from Artifact Registry:
+       ```shell
+       ./hack/release-staging-digests.sh
+       ```
+    2. Ensure the PR updates all release artifacts:
+       - `charts/inferencepool`
+       - `charts/body-based-routing`
+       - `charts/standalone`
+       - `epp`
+       - `bbr`
+       - `latency-prediction-server`
+       - `latency-training-server`
+    3. If an artifact does not yet have a section in `images.yaml` (for example a newly added chart), add a new section before adding the digest mapping.
     **Note:** Add a link to this issue when the PR is merged.
-11. Test the steps in the tagged quickstart guide after the PR merges, for example: `https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/v0.1.0-rc.1/pkg/README.md`.
-12. Create a [new release][]:
-    1. Choose the tag that you created for the release.
+10. Test the quickstart guide steps after the k8s.io PR merges:
+    1. Follow the tagged quickstart guide at `site-src/guides/index.md`, for example: `https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/v0.1.0-rc.1/site-src/guides/index.md`.
+    2. **Note:** Instead of running the `curl` command to set `IGW_LATEST_RELEASE`, manually set it to the version being tested (e.g., `export IGW_LATEST_RELEASE=v0.1.0-rc.1`). The guide's curl command filters out prereleases and will not resolve the new tag until after it is published.
+    3. **Note:** The release asset URL (`releases/download/.../manifests.yaml`) does not exist yet. Use the locally generated `artifacts/manifests.yaml` for CRD installation during this step.
+11. Create a [new release][]:
+    1. Choose the root tag that you created for the release, for example `v1.5.0`.
     2. Use the tag as the release title, i.e. `v0.1.0` refer to previous release for the content of the release body.
     3. Click "Generate release notes" and preview the release body.
     4. Click "Attach binaries by dropping them here or selecting them." and add the contents of the `artifacts` directory generated from `make release`.
     5. If this is a release candidate, select the "This is a pre-release" checkbox.
+12. Verify the release asset URL after publishing:
+    - Download the `manifests.yaml` asset from the newly created GitHub release and confirm it can be applied successfully with `kubectl apply -f`.
 13. If you find any bugs in this process, create an [issue][].
 
 ## Announce the Release

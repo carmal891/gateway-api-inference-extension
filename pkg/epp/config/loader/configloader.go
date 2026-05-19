@@ -19,6 +19,7 @@ package loader
 import (
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -31,16 +32,19 @@ import (
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/datalayer"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/flowcontrol"
 	fwkdl "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/datalayer"
+	fwkflowcontrol "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/flowcontrol"
 	fwkplugin "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/plugin"
+	fwkrh "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/requesthandling"
 	framework "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/scheduling"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/plugins/scheduling/profile"
-	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/saturationdetector/framework/plugins/utilizationdetector"
+	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/handlers"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/scheduling"
 )
 
 var (
-	scheme                 = runtime.NewScheme()
-	registeredFeatureGates = sets.New[string]()
+	scheme                   = runtime.NewScheme()
+	registeredFeatureGatesMu sync.RWMutex
+	registeredFeatureGates   = sets.New[string]()
 )
 
 func init() {
@@ -49,6 +53,8 @@ func init() {
 
 // RegisterFeatureGate registers a feature gate name for validation purposes.
 func RegisterFeatureGate(gate string) {
+	registeredFeatureGatesMu.Lock()
+	defer registeredFeatureGatesMu.Unlock()
 	registeredFeatureGates.Insert(gate)
 }
 
@@ -95,7 +101,7 @@ func InstantiateAndConfigure(
 	if err := applySystemDefaults(rawConfig, handle); err != nil {
 		return nil, fmt.Errorf("system default application failed: %w", err)
 	}
-	logger.Info("Effective configuration loaded", "config", rawConfig)
+	logger.Info("Instantiated all plugins and applied system defaults. Effective raw configuration", "config", rawConfig.String())
 
 	if err := validateConfig(rawConfig); err != nil {
 		return nil, fmt.Errorf("configuration validation failed: %w", err)
@@ -107,9 +113,16 @@ func InstantiateAndConfigure(
 	}
 
 	featureGates := loadFeatureConfig(rawConfig.FeatureGates)
-	dataConfig, err := buildDataLayerConfig(rawConfig.Data, featureGates[datalayer.ExperimentalDatalayerFeatureGate], handle)
-	if err != nil {
-		return nil, fmt.Errorf("data layer config build failed: %w", err)
+	var dataConfig *datalayer.Config
+	if !featureGates[datalayer.EnableLegacyMetricsFeatureGate] {
+		var err error
+		dataConfig, err = buildDataLayerConfig(rawConfig.DataLayer, handle)
+		if err != nil {
+			return nil, fmt.Errorf("data layer config build failed: %w", err)
+		}
+		if len(dataConfig.Sources) == 0 {
+			logger.Info("No data sources configured; metrics collection is disabled")
+		}
 	}
 
 	var flowControlConfig *flowcontrol.Config
@@ -121,11 +134,26 @@ func InstantiateAndConfigure(
 		}
 	}
 
+	parserConfig, err := buildParserConfig(rawConfig.Parser, handle)
+	if err != nil {
+		return nil, fmt.Errorf("parse config build failed: %w", err)
+	}
+
+	plugin, ok := handle.GetAllPluginsWithNames()[rawConfig.SaturationDetector.PluginRef]
+	if !ok {
+		return nil, fmt.Errorf("saturation detector plugin '%s' not found", rawConfig.SaturationDetector.PluginRef)
+	}
+	saturationDetector, ok := plugin.(fwkflowcontrol.SaturationDetector)
+	if !ok {
+		return nil, fmt.Errorf("plugin '%s' is not a fwkflowcontrol.SaturationDetector", rawConfig.SaturationDetector.PluginRef)
+	}
+
 	return &config.Config{
-		SchedulerConfig:          schedulerConfig,
-		SaturationDetectorConfig: buildSaturationConfig(rawConfig.SaturationDetector),
-		DataConfig:               dataConfig,
-		FlowControlConfig:        flowControlConfig,
+		SchedulerConfig:    schedulerConfig,
+		SaturationDetector: saturationDetector,
+		DataConfig:         dataConfig,
+		FlowControlConfig:  flowControlConfig,
+		ParserConfig:       parserConfig,
 	}, nil
 }
 
@@ -153,7 +181,6 @@ func instantiatePlugins(configuredPlugins []configapi.PluginSpec, handle fwkplug
 		if !ok {
 			return fmt.Errorf("plugin type '%s' is not registered", spec.Type)
 		}
-
 		plugin, err := factory(spec.Name, spec.Parameters, handle)
 		if err != nil {
 			return fmt.Errorf("failed to create plugin '%s' (type: %s): %w", spec.Name, spec.Type, err)
@@ -161,6 +188,7 @@ func instantiatePlugins(configuredPlugins []configapi.PluginSpec, handle fwkplug
 
 		handle.AddPlugin(spec.Name, plugin)
 	}
+
 	return nil
 }
 
@@ -221,6 +249,8 @@ func buildSchedulerConfig(
 }
 
 func loadFeatureConfig(gates configapi.FeatureGates) map[string]bool {
+	registeredFeatureGatesMu.RLock()
+	defer registeredFeatureGatesMu.RUnlock()
 	config := make(map[string]bool, len(registeredFeatureGates))
 	for gate := range registeredFeatureGates {
 		config[gate] = false
@@ -231,33 +261,24 @@ func loadFeatureConfig(gates configapi.FeatureGates) map[string]bool {
 	return config
 }
 
-func buildSaturationConfig(apiConfig *configapi.SaturationDetector) *utilizationdetector.Config {
-	cfg := &utilizationdetector.Config{
-		QueueDepthThreshold:       utilizationdetector.DefaultQueueDepthThreshold,
-		KVCacheUtilThreshold:      utilizationdetector.DefaultKVCacheUtilThreshold,
-		MetricsStalenessThreshold: utilizationdetector.DefaultMetricsStalenessThreshold,
+func buildParserConfig(rawParserConfig *configapi.ParserConfig, handle fwkplugin.Handle) (*handlers.Config, error) {
+	if rawParserConfig == nil {
+		return nil, errors.New("parserConfig is not configured")
 	}
-
-	if apiConfig != nil {
-		if apiConfig.QueueDepthThreshold > 0 {
-			cfg.QueueDepthThreshold = apiConfig.QueueDepthThreshold
-		}
-		if apiConfig.KVCacheUtilThreshold > 0.0 && apiConfig.KVCacheUtilThreshold < 1.0 {
-			cfg.KVCacheUtilThreshold = apiConfig.KVCacheUtilThreshold
-		}
-		if apiConfig.MetricsStalenessThreshold.Duration > 0 {
-			cfg.MetricsStalenessThreshold = apiConfig.MetricsStalenessThreshold.Duration
-		}
+	plugin, ok := handle.GetAllPluginsWithNames()[rawParserConfig.PluginRef]
+	if !ok {
+		return nil, errors.New("the configured parser is not loaded")
 	}
-
-	return cfg
+	v, ok := plugin.(fwkrh.Parser)
+	if !ok {
+		return nil, errors.New("the specified plugin is not a parser plugin in the config")
+	}
+	return &handlers.Config{
+		Parser: v,
+	}, nil
 }
 
-func buildDataLayerConfig(rawDataConfig *configapi.DataLayerConfig, dataLayerEnabled bool, handle fwkplugin.Handle) (*datalayer.Config, error) {
-	if dataLayerEnabled && (rawDataConfig == nil || rawDataConfig.Sources == nil) { // enabled but no configuration
-		return nil, errors.New("the Datalayer has been enabled. You must specify the Data section in the configuration")
-	}
-
+func buildDataLayerConfig(rawDataConfig *configapi.DataLayerConfig, handle fwkplugin.Handle) (*datalayer.Config, error) {
 	cfg := datalayer.Config{
 		Sources: []datalayer.DataSourceConfig{},
 	}

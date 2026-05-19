@@ -60,7 +60,7 @@ func PrepareForTestStreamingServer(objectives []*v1alpha2.InferenceObjective, po
 	}
 	for _, pod := range pods {
 		initObjs = append(initObjs, pod)
-		ds.PodUpdateOrAddIfNotExist(pod)
+		ds.PodUpdateOrAddIfNotExist(ctx, pod)
 	}
 
 	scheme := runtime.NewScheme()
@@ -78,8 +78,7 @@ func PrepareForTestStreamingServer(objectives []*v1alpha2.InferenceObjective, po
 	return ctx, cancel, ds, pmc
 }
 
-func SetupTestStreamingServer(t *testing.T, ctx context.Context, ds datastore.Datastore,
-	streamingServer pb.ExternalProcessorServer) (*bufconn.Listener, chan error) {
+func SetupTestStreamingServer(t *testing.T, ctx context.Context, streamingServer pb.ExternalProcessorServer) (*bufconn.Listener, chan error) {
 	testListener = bufconn.Listen(bufSize)
 
 	errChan := make(chan error)

@@ -25,6 +25,8 @@ NAMESPACE="igw-e2e"
 CLI_MODEL_ID=""
 VERBOSE=false
 TEST_CHAT=false
+HOST_ARG=""
+PORT_ARG=""
 
 # ── Flag parsing ────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -35,6 +37,12 @@ while [[ $# -gt 0 ]]; do
     -m|--model)
       if [[ -z "$2" ]]; then echo "Error: $1 requires a value." >&2; exit 1; fi
       CLI_MODEL_ID="$2"; shift 2 ;;
+    --host)
+      if [[ -z "$2" ]]; then echo "Error: $1 requires a value." >&2; exit 1; fi
+      HOST_ARG="$2"; shift 2 ;;
+    --port)
+      if [[ -z "$2" ]]; then echo "Error: $1 requires a value." >&2; exit 1; fi
+      PORT_ARG="$2"; shift 2 ;;
     -c|--chatValidation)  TEST_CHAT=true; shift ;;
     -v|--verbose)   VERBOSE=true; shift ;;
     -h|--help)      show_help ;;
@@ -50,14 +58,30 @@ fi
 gen_id() { echo $(( RANDOM % 10000 + 1 )); }
 
 # ── Discover Gateway address ────────────────────────────────────────────────
-HOST="${GATEWAY_HOST:-$(kubectl get gateway -n "$NAMESPACE" \
-          -o jsonpath='{.items[0].status.addresses[0].value}' 2>/dev/null || true)}"
-if [[ -z "$HOST" ]]; then
-  echo "Error: could not discover a Gateway address in namespace '$NAMESPACE'." >&2
-  exit 1
+if [[ -n "$HOST_ARG" ]]; then
+  HOST="$HOST_ARG"
+  PORT="${PORT_ARG:-80}"
+else
+  HOST="${GATEWAY_HOST:-$(kubectl get gateway -n "$NAMESPACE" \
+            -o jsonpath='{.items[0].status.addresses[0].value}' 2>/dev/null || true)}"
+
+  if [[ -z "$HOST" ]]; then
+    echo "No Gateway found, checking for standalone EPP service..."
+    # Try to find a service with the 'app.kubernetes.io/name' label which is used in EPP services
+    HOST=$(kubectl get svc -n "$NAMESPACE" -l app.kubernetes.io/name -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+    if [[ -z "$HOST" ]]; then
+       echo "Error: could not discover a Gateway address or standalone service in namespace '$NAMESPACE'." >&2
+       exit 1
+    fi
+    PORT="${PORT_ARG:-8081}"
+    echo "Found standalone service: $HOST on port $PORT"
+  else
+    PORT="${PORT_ARG:-80}"
+  fi
 fi
-PORT=80
+
 SVC_HOST="${HOST}:${PORT}"
+
 
 # ── Determine MODEL_ID ──────────────────────────────────────────────────────
 if [[ -n "$CLI_MODEL_ID" ]]; then
@@ -90,14 +114,10 @@ for i in {1..7}; do
     ID=$(gen_id)
 
     ret=0
-    output=$(kubectl run --rm -i curl-"$ID" \
-            --namespace "$NAMESPACE" \
-            --image=curlimages/curl --restart=Never \
-            --env "PAYLOAD=$chat_payload" -- \
-            sh -c 'sleep 1; curl -sS -X POST "http://'${SVC_HOST}'/v1/chat/completions" \
-                -H "accept: application/json" \
-                -H "Content-Type: application/json" \
-                -d "$PAYLOAD"') || ret=$?
+    output=$(curl -sS -X POST "http://$SVC_HOST/v1/chat/completions" \
+            -H "accept: application/json" \
+            -H "Content-Type: application/json" \
+            -d "$chat_payload")
     echo "$output"
     [[ $ret -ne 0 || "$output" != *'{'* ]] && {
       echo "Error: POST /v1/chat/completions failed (exit $ret or no JSON)" >&2; failed=true; }
@@ -110,14 +130,10 @@ for i in {1..7}; do
   ID=$(gen_id)
 
   ret=0
-  output=$(kubectl run --rm -i curl-"$ID" \
-          --namespace "$NAMESPACE" \
-          --image=curlimages/curl --restart=Never \
-          --env "PAYLOAD=$payload" -- \
-          sh -c 'sleep 1; curl -sS -X POST "http://'${SVC_HOST}'/v1/completions" \
-               -H "accept: application/json" \
-               -H "Content-Type: application/json" \
-               -d "$PAYLOAD"') || ret=$?
+output=$(curl -sS -X POST "http://$SVC_HOST/v1/completions" \
+            -H "accept: application/json" \
+            -H "Content-Type: application/json" \
+            -d "$payload")
   echo "$output"
   [[ $ret -ne 0 || "$output" != *'{'* ]] && {
     echo "Error: POST /v1/completions failed (exit $ret or no JSON)" >&2; failed=true; }

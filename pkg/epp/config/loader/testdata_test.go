@@ -46,9 +46,7 @@ featureGates:
 - dataLayer
 - flowControl
 saturationDetector:
-  queueDepthThreshold: 10
-  kvCacheUtilThreshold: 0.8
-  metricsStalenessThreshold: 100ms
+  pluginRef: utilization-detector
 `
 
 // successNoProfilesText represents a valid config with plugins but no profiles.
@@ -86,7 +84,7 @@ schedulingProfiles:
   - pluginRef: testScorer
     weight: 50
   - pluginRef: maxScorePicker
-data:
+dataLayer:
   sources:
   - pluginRef: testSource
     extractors:
@@ -156,7 +154,7 @@ schedulingProfiles:
 featureGates:
 - flowControl
 flowControl:
-  maxBytes: 1024
+  maxBytes: "1024"
   defaultRequestTTL: 1m
 `
 
@@ -172,7 +170,7 @@ schedulingProfiles:
   - pluginRef: maxScore
 featureGates: [] # Explicitly empty
 flowControl:
-  maxBytes: 1024
+  maxBytes: "1024"
 `
 
 // successComplexFlowControlConfigText tests that Flow Control configuration with custom plugins is correctly loaded.
@@ -197,6 +195,52 @@ flowControl:
   - priority: 100
     orderingPolicyRef: customFCFS
     fairnessPolicyRef: customFairness
+`
+
+// successParserConfigText tests that configuration with parser plugin is correctly loaded.
+const successParserConfigText = `
+apiVersion: inference.networking.x-k8s.io/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- name: maxScore
+  type: max-score-picker
+- type: openai-parser
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: maxScore
+parser:
+  pluginRef: openai-parser
+`
+
+// successWithNoParserConfigText tests that a default openaiParser is injected when no parser is configured.
+const successWithNoParserConfigText = `
+apiVersion: inference.networking.x-k8s.io/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- name: maxScore
+  type: max-score-picker
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: maxScore
+`
+
+// successParserConfigText tests that configuration with parser plugin with custom name is correctly loaded.
+const successParserWithNameConfigText = `
+apiVersion: inference.networking.x-k8s.io/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- name: maxScore
+  type: max-score-picker
+- name: openaiParser
+  type: openai-parser
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: maxScore
+parser:
+  pluginRef: openaiParser
 `
 
 // --- Invalid Configurations (Syntax/Structure) ---
@@ -302,6 +346,17 @@ schedulingProfiles:
 - name: default
   plugins:
   - pluginRef: non-existent-plugin
+`
+
+// errorUndefinedSaturationDetectorPluginText references a plugin that is not defined.
+const errorUndefinedSaturationDetectorPluginText = `
+apiVersion: inference.networking.x-k8s.io/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- name: test1
+  type: test-plugin
+saturationDetector:
+  pluginRef: unknown-plugin
 `
 
 // errorDuplicatePluginText defines the same plugin name twice.
@@ -418,19 +473,72 @@ schedulingProfiles:
   - pluginRef: maxScore
 `
 
-// errorMissingDataConfigText has the datalayer enabled without config
-const errorMissingDataConfigText = `
+// successDataLayerAutoDefaultText has the datalayer enabled without data config.
+// The loader should auto-populate default datalayer plugins.
+// successDataLayerAutoDefaultText has NO featureGates — datalayer is enabled by default.
+const successDataLayerAutoDefaultText = `
 apiVersion: inference.networking.x-k8s.io/v1alpha1
 kind: EndpointPickerConfig
 plugins:
-- name: test1
-  type: test-one
-  parameters:
-    threshold: 10
+- name: maxScore
+  type: max-score-picker
 schedulingProfiles:
 - name: default
   plugins:
-  - pluginRef: test1
+  - pluginRef: maxScore
+`
+
+// successDataLayerDisabledText opts out of the datalayer via the enableLegacyMetrics gate.
+const successDataLayerDisabledText = `
+apiVersion: inference.networking.x-k8s.io/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- name: maxScore
+  type: max-score-picker
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: maxScore
+featureGates:
+- enableLegacyMetrics
+`
+
+// successDataLayerNoSourcesText has an explicit empty dataLayer section with no sources.
+// The loader should NOT inject defaults — the empty section signals "no metrics collection".
+const successDataLayerNoSourcesText = `
+apiVersion: inference.networking.x-k8s.io/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- name: maxScore
+  type: max-score-picker
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: maxScore
+dataLayer: {}
+`
+
+// successDataLayerExplicitConfigText has the datalayer enabled with explicit data config.
+// The loader should preserve the user's config and NOT overwrite with defaults.
+const successDataLayerExplicitConfigText = `
+apiVersion: inference.networking.x-k8s.io/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- name: maxScore
+  type: max-score-picker
+- name: testSource
+  type: test-source
+- name: testExtractor
+  type: test-extractor
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: maxScore
+dataLayer:
+  sources:
+  - pluginRef: testSource
+    extractors:
+    - pluginRef: testExtractor
 featureGates:
 - dataLayer
 `
@@ -448,7 +556,7 @@ schedulingProfiles:
 - name: default
   plugins:
   - pluginRef: test1
-data:
+dataLayer:
   sources:
   - pluginRef: test-one
 featureGates:
@@ -470,7 +578,7 @@ schedulingProfiles:
 - name: default
   plugins:
   - pluginRef: test1
-data:
+dataLayer:
   sources:
   - pluginRef: test-source
     extractors:
@@ -520,4 +628,72 @@ flowControl:
   priorityBands:
   - priority: 100
     orderingPolicyRef: testScorer # Wrong type
+`
+
+// errorParserWrongPluginTypeText references a plugin of the wrong type (Scorer instead of Parser).
+const errorParserWrongPluginTypeText = `
+apiVersion: inference.networking.x-k8s.io/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- name: maxScore
+  type: max-score-picker
+- name: openaiParser
+  type: openai-parser
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: maxScore
+parser:
+  pluginRef: maxScore # Wrong name
+`
+
+// errorParserWrongPluginTypeName references a plugin of the wrong name.
+const errorParserWrongPluginNameText = `
+apiVersion: inference.networking.x-k8s.io/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- name: maxScore
+  type: max-score-picker
+- name: openaiParser
+  type: openai-parser
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: maxScore
+parser:
+  pluginRef: wrongParser # Wrong names
+`
+
+// successFilterOrderConfigText defines filters and scorers in a specific order.
+// Used to verify that the full YAML→config→profile pipeline preserves
+// plugin declaration order.
+const successFilterOrderConfigText = `
+apiVersion: inference.networking.x-k8s.io/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- name: filter-A
+  type: test-order-filter
+- name: filter-B
+  type: test-order-filter
+- name: filter-C
+  type: test-order-filter
+- name: scorer-X
+  type: test-scorer
+- name: scorer-Y
+  type: test-scorer
+- name: profileHandler
+  type: single-profile-handler
+- name: maxScorePicker
+  type: max-score-picker
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: filter-A
+  - pluginRef: filter-B
+  - pluginRef: filter-C
+  - pluginRef: scorer-X
+    weight: 10
+  - pluginRef: scorer-Y
+    weight: 20
+  - pluginRef: maxScorePicker
 `

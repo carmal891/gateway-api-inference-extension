@@ -19,83 +19,74 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
-	basepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	eppb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/bbr/framework"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/bbr/metrics"
-	"sigs.k8s.io/gateway-api-inference-extension/pkg/common"
+	envoy "sigs.k8s.io/gateway-api-inference-extension/pkg/common/envoy"
+	errcommon "sigs.k8s.io/gateway-api-inference-extension/pkg/common/error"
 	logutil "sigs.k8s.io/gateway-api-inference-extension/pkg/common/observability/logging"
-	requtil "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/util/request"
 )
 
-const (
-	modelHeader     = "X-Gateway-Model-Name"
-	baseModelHeader = "X-Gateway-Base-Model-Name"
+// HandleRequestHeaders extracts request headers into reqCtx and returns
+// the ext-proc header response.
+func (s *Server) HandleRequestHeaders(ctx context.Context, reqCtx *RequestContext, headers *eppb.HttpHeaders, streaming bool) []*eppb.ProcessingResponse {
+	reqCtx.RequestReceivedTimestamp = time.Now()
 
-	executeExtensionPoint = "Request"
-)
+	if headers != nil && headers.Headers != nil {
+		for _, header := range headers.Headers.Headers {
+			reqCtx.Request.Headers[header.Key] = envoy.GetHeaderValue(header)
+		}
+	}
 
-// HandleRequestBody handles request bodies.
-func (s *Server) HandleRequestBody(ctx context.Context, requestBodyBytes []byte) ([]*eppb.ProcessingResponse, error) {
-	logger := log.FromContext(ctx)
+	if streaming && !headers.GetEndOfStream() {
+		log.FromContext(ctx).V(logutil.VERBOSE).Info("captured request headers, deferring response until body arrives...")
+		return nil
+	}
+	// if we're here, that means we're in non-streaming, or we're in streaming and got end of stream(means no body).
+	// in both cases we can return HeadersResponse
+	return []*eppb.ProcessingResponse{
+		{
+			Response: &eppb.ProcessingResponse_RequestHeaders{
+				RequestHeaders: &eppb.HeadersResponse{},
+			},
+		},
+	}
+}
+
+// HandleRequestBody parses the raw body bytes into reqCtx.Request.Body and processes the request.
+func (s *Server) HandleRequestBody(ctx context.Context, reqCtx *RequestContext, requestBodyBytes []byte) ([]*eppb.ProcessingResponse, error) {
 	var ret []*eppb.ProcessingResponse
 
-	var requestBody map[string]any
-	if err := json.Unmarshal(requestBodyBytes, &requestBody); err != nil {
+	if err := json.Unmarshal(requestBodyBytes, &reqCtx.Request.Body); err != nil {
+		return nil, errcommon.Error{Code: errcommon.BadRequest, Msg: fmt.Sprintf("failed to parse request body: %v", err)}
+	}
+
+	if err := s.runRequestPlugins(ctx, reqCtx.CycleState, reqCtx.Request); err != nil {
 		return nil, err
 	}
 
-	targetModelAny, ok := requestBody["model"]
-	if !ok {
-		metrics.RecordModelNotParsedCounter()
-		targetModelAny = ""
-	}
-
-	targetModel, ok := targetModelAny.(string)
-	if !ok {
-		metrics.RecordModelNotParsedCounter()
-		return nil, errors.New("model is not a string")
-	}
-
-	logger.Info("Parsed model name", "model", targetModel)
-
-	if targetModel == "" {
-		metrics.RecordModelNotInBodyCounter()
-		logger.V(logutil.DEFAULT).Info("Request body does not contain model parameter")
-		if s.streaming {
-			ret = append(ret, &eppb.ProcessingResponse{
-				Response: &eppb.ProcessingResponse_RequestHeaders{
-					RequestHeaders: &eppb.HeadersResponse{},
-				},
-			})
-			ret = addStreamedBodyResponse(ret, requestBodyBytes)
-			return ret, nil
-		} else {
-			ret = append(ret, &eppb.ProcessingResponse{
-				Response: &eppb.ProcessingResponse_RequestBody{
-					RequestBody: &eppb.BodyResponse{},
-				},
-			})
+	bodyMutated := reqCtx.Request.BodyMutated()
+	var mutatedBodyBytes []byte
+	if bodyMutated {
+		var err error
+		mutatedBodyBytes, err = json.Marshal(reqCtx.Request.Body)
+		if err != nil {
+			return nil, err
 		}
-		return ret, nil
-	}
-
-	// TODO pass headers!
-	// TODO handle updated headers and body
-	if err := s.executePlugins(ctx, map[string]string{}, requestBody, s.requestPlugins); err != nil {
-		return nil, fmt.Errorf("failed to execute request plugins - %w", err)
+		reqCtx.Request.SetHeader(contentLengthHeader, strconv.Itoa(len(mutatedBodyBytes)))
+	} else if s.streaming {
+		// In streaming mode, always set Content-Length even if body is not mutated
+		// to inform Envoy of the body size that will follow
+		reqCtx.Request.SetHeader(contentLengthHeader, strconv.Itoa(len(requestBodyBytes)))
 	}
 
 	metrics.RecordSuccessCounter()
-	baseModel := s.ds.GetBaseModel(targetModel)
-
-	logger.Info("Base model from datastore", "baseModel", baseModel)
 
 	if s.streaming {
 		ret = append(ret, &eppb.ProcessingResponse{
@@ -104,72 +95,59 @@ func (s *Server) HandleRequestBody(ctx context.Context, requestBodyBytes []byte)
 					Response: &eppb.CommonResponse{
 						ClearRouteCache: true,
 						HeaderMutation: &eppb.HeaderMutation{
-							SetHeaders: []*basepb.HeaderValueOption{
-								{
-									Header: &basepb.HeaderValue{
-										Key:      modelHeader,
-										RawValue: []byte(targetModel),
-									},
-								},
-								{
-									Header: &basepb.HeaderValue{
-										Key:      baseModelHeader,
-										RawValue: []byte(baseModel),
-									},
-								},
-							},
+							SetHeaders:    envoy.GenerateHeadersMutation(reqCtx.Request.MutatedHeaders()),
+							RemoveHeaders: reqCtx.Request.RemovedHeaders(),
 						},
 					},
 				},
 			},
 		})
-		ret = addStreamedBodyResponse(ret, requestBodyBytes)
+		if bodyMutated {
+			ret = addStreamedBodyResponse(ret, mutatedBodyBytes)
+		} else {
+			ret = addStreamedBodyResponse(ret, requestBodyBytes)
+		}
 		return ret, nil
+	}
+
+	// Necessary so that the new headers are used in the routing decision.
+	response := &eppb.CommonResponse{
+		ClearRouteCache: true,
+		HeaderMutation: &eppb.HeaderMutation{
+			SetHeaders:    envoy.GenerateHeadersMutation(reqCtx.Request.MutatedHeaders()),
+			RemoveHeaders: reqCtx.Request.RemovedHeaders(),
+		},
+	}
+	if bodyMutated {
+		response.BodyMutation = &eppb.BodyMutation{
+			Mutation: &eppb.BodyMutation_Body{
+				Body: mutatedBodyBytes,
+			},
+		}
 	}
 
 	return []*eppb.ProcessingResponse{
 		{
 			Response: &eppb.ProcessingResponse_RequestBody{
 				RequestBody: &eppb.BodyResponse{
-					Response: &eppb.CommonResponse{
-						// Necessary so that the new headers are used in the routing decision.
-						ClearRouteCache: true,
-						HeaderMutation: &eppb.HeaderMutation{
-							SetHeaders: []*basepb.HeaderValueOption{
-								{
-									Header: &basepb.HeaderValue{
-										Key:      modelHeader,
-										RawValue: []byte(targetModel),
-									},
-								},
-								{
-									Header: &basepb.HeaderValue{
-										Key:      baseModelHeader,
-										RawValue: []byte(baseModel),
-									},
-								},
-							},
-						},
-					},
+					Response: response,
 				},
 			},
 		},
 	}, nil
 }
 
-// executePlugins executes BBR plugins in the order they were registered.
-func (s *Server) executePlugins(ctx context.Context, headers map[string]string, body map[string]any,
-	plugins []framework.PayloadProcessor) error {
-	updatedHeaders := headers
-	updatedBody := body
+// runRequestPlugins executes request plugins in the order they were registered.
+func (s *Server) runRequestPlugins(ctx context.Context, cycleState *framework.CycleState, request *framework.InferenceRequest) error {
 	var err error
-	for _, plugin := range plugins {
-		log.FromContext(ctx).Info("Executing request plugin", "plugin", plugin.TypedName())
+	for _, plugin := range s.requestPlugins {
+		log.FromContext(ctx).V(logutil.VERBOSE).Info("Executing request plugin", "plugin", plugin.TypedName())
 		before := time.Now()
-		updatedHeaders, updatedBody, err = plugin.Execute(ctx, updatedHeaders, updatedBody)
-		metrics.RecordPluginProcessingLatency(executeExtensionPoint, plugin.TypedName().Type, plugin.TypedName().Name, time.Since(before))
+		err = plugin.ProcessRequest(ctx, cycleState, request)
+		metrics.RecordPluginProcessingLatency(requestPluginExtensionPoint, plugin.TypedName().Type, plugin.TypedName().Name, time.Since(before))
 		if err != nil {
-			return fmt.Errorf("failed to execute payload processor %s - %w", plugin.TypedName(), err)
+			log.FromContext(ctx).V(logutil.DEFAULT).Error(err, "Failed to execute request plugin", "plugin", plugin.TypedName())
+			return err
 		}
 	}
 
@@ -177,7 +155,7 @@ func (s *Server) executePlugins(ctx context.Context, headers map[string]string, 
 }
 
 func addStreamedBodyResponse(responses []*eppb.ProcessingResponse, requestBodyBytes []byte) []*eppb.ProcessingResponse {
-	commonResponses := common.BuildChunkedBodyResponses(requestBodyBytes, true)
+	commonResponses := envoy.BuildChunkedBodyResponses(requestBodyBytes, true)
 	for _, commonResp := range commonResponses {
 		responses = append(responses, &eppb.ProcessingResponse{
 			Response: &eppb.ProcessingResponse_RequestBody{
@@ -188,26 +166,6 @@ func addStreamedBodyResponse(responses []*eppb.ProcessingResponse, requestBodyBy
 		})
 	}
 	return responses
-}
-
-// HandleRequestHeaders extracts request headers into reqCtx and returns
-// the ext-proc header response.
-func (s *Server) HandleRequestHeaders(reqCtx *RequestContext, headers *eppb.HttpHeaders) ([]*eppb.ProcessingResponse, error) {
-	reqCtx.RequestReceivedTimestamp = time.Now()
-
-	if headers != nil && headers.Headers != nil {
-		for _, header := range headers.Headers.Headers {
-			reqCtx.Request.Headers[header.Key] = requtil.GetHeaderValue(header)
-		}
-	}
-
-	return []*eppb.ProcessingResponse{
-		{
-			Response: &eppb.ProcessingResponse_RequestHeaders{
-				RequestHeaders: &eppb.HeadersResponse{},
-			},
-		},
-	}, nil
 }
 
 // HandleRequestTrailers handles request trailers.

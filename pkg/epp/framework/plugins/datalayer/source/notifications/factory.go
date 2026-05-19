@@ -35,7 +35,7 @@ type notificationSourceParams struct {
 	Group string `json:"group"`
 	// Version is the API version (e.g., "v1", "v1beta1").
 	Version string `json:"version"`
-	// Kind is the resource kind (e.g., "ConfigMap", "Deployment").
+	// Kind is the resource kind (e.g., "Pod", "Service").
 	Kind string `json:"kind"`
 }
 
@@ -66,4 +66,12 @@ func NotificationSourceFactory(name string, parameters json.RawMessage, _ fwkplu
 	}
 
 	return NewK8sNotificationSource(NotificationSourceType, name, gvk), nil
+}
+
+// EndpointSourceFactory is the factory function for endpoint notification source plugins.
+func EndpointSourceFactory(name string, _ json.RawMessage, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
+	if name == "" {
+		name = EndpointNotificationSourceType
+	}
+	return NewEndpointDataSource(EndpointNotificationSourceType, name), nil
 }

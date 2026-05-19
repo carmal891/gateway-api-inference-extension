@@ -13,6 +13,15 @@ This is achieved by leveraging Envoy's [External Processing] (ext-proc) to exten
 ## New!
 Inference Gateway has partnered with vLLM to accelerate LLM serving optimizations with [llm-d](https://llm-d.ai/blog/llm-d-announce)!
 
+> [!IMPORTANT]
+> The Endpoint Picker (EPP), InferenceObjective and InferenceModelRewrite APIs, and Body Based Router (BBR) packages have moved to new repositories:
+> - EPP and associated APIs: [llm-d/llm-d-inference-scheduler](https://github.com/llm-d/llm-d-inference-scheduler)
+> - BBR: [llm-d/llm-d-inference-payload-processor](https://github.com/llm-d/llm-d-inference-payload-processor)
+>
+> No new code will be accepted to these packages in this repository, and they will be archived soon. This move was proposed and discussed in [issue #2430](https://github.com/kubernetes-sigs/gateway-api-inference-extension/issues/2430).
+>
+> This repository will continue to host the **lightweight EPP (LWEPP)** and the **InferencePool API**, and will remain the primary location for the development and maintenance of **conformance tests**.
+
 ## Concepts and Definitions
 
 The following specific terms to this project:
@@ -65,7 +74,7 @@ This extension upgrades an [ext-proc](https://www.envoyproxy.io/docs/envoy/lates
 
 The Inference Gateway:
 
-* Improves the tail latency and throughput of LLM completion requests against Kubernetes-hosted model servers using an extensible request scheduling alogrithm that is kv-cache and request cost aware, avoiding evictions or queueing as load increases
+* Improves the tail latency and throughput of LLM completion requests against Kubernetes-hosted model servers using an extensible request scheduling algorithm that is kv-cache and request cost aware, avoiding evictions or queueing as load increases
 * Provides [Kubernetes-native declarative APIs](https://gateway-api-inference-extension.sigs.k8s.io/concepts/api-overview/) to route client model names to use-case specific LoRA adapters and control incremental rollout of new adapter versions, A/B traffic splitting, and safe blue-green base model and model server upgrades
 * Adds end to end observability around service objective attainment
 * Ensures operational guardrails between different client model names, allowing a platform team to safely serve many different GenAI workloads on the same pool of shared foundation model servers for higher utilization and fewer required accelerators
@@ -112,7 +121,10 @@ Follow this [README](./test/e2e/epp/README.md) to learn more about running the i
 
 ## Contributing
 
-Our community meeting is weekly at Thursday 10AM PDT ([Zoom](https://zoom.us/j/96271651417?pwd=NViXawg6lMsRjgXbu2YmW8DxWqbjta.1), [Meeting Notes](https://www.google.com/url?q=https://docs.google.com/document/d/1frfPE5L1sI3737rdQV04IcDGeOcGJj2ItjMg6z2SRH0/edit?usp%3Dsharing&sa=D&source=calendar&usd=2&usg=AOvVaw1pUVy7UN_2PMj8qJJcFm1U)).
+Community meetings have moved to the llm-d Inference Scheduler community
+meeting. See the [llm-d Inference Scheduler contributing
+section](https://github.com/llm-d/llm-d-inference-scheduler/blob/main/README.md#contributing)
+for current meeting details.
 
 We currently utilize the [#gateway-api-inference-extension](https://kubernetes.slack.com/?redir=%2Fmessages%2Fgateway-api-inference-extension) channel in Kubernetes Slack workspace for communications.
 

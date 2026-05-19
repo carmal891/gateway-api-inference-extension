@@ -17,6 +17,7 @@ limitations under the License.
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"strings"
@@ -27,34 +28,50 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	envoy "sigs.k8s.io/gateway-api-inference-extension/pkg/common/envoy"
+	errcommon "sigs.k8s.io/gateway-api-inference-extension/pkg/common/error"
 	logutil "sigs.k8s.io/gateway-api-inference-extension/pkg/common/observability/logging"
+	reqcommon "sigs.k8s.io/gateway-api-inference-extension/pkg/common/request"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/datalayer"
 	fwkdl "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/datalayer"
-	fwkrq "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/requestcontrol"
+	fwkrh "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/requesthandling"
 	schedulingtypes "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/scheduling"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/metrics"
-	errutil "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/util/error"
-	requtil "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/util/request"
+	"sigs.k8s.io/gateway-api-inference-extension/version"
 )
 
-func NewStreamingServer(datastore Datastore, director Director) *StreamingServer {
+// EvictChannelLookup is an optional interface for looking up eviction channels by request ID.
+// When set on the StreamingServer, the Process() loop will select on the eviction channel
+// to support eviction of in-flight requests via ext_proc ImmediateResponse.
+type EvictChannelLookup interface {
+	Get(requestID string) chan struct{}
+	Deregister(requestID string)
+}
+
+func NewStreamingServer(datastore Datastore, director Director, parser fwkrh.Parser) *StreamingServer {
 	return &StreamingServer{
 		director:  director,
 		datastore: datastore,
+		parser:    parser,
 	}
 }
 
+// SetEvictChannelLookup sets the eviction channel lookup for eviction support.
+func (s *StreamingServer) SetEvictChannelLookup(lookup EvictChannelLookup) {
+	s.evictionLookup = lookup
+}
+
 type Director interface {
-	HandleRequest(ctx context.Context, reqCtx *RequestContext) (*RequestContext, error)
-	HandleResponseReceived(ctx context.Context, reqCtx *RequestContext) (*RequestContext, error)
-	HandleResponseBodyStreaming(ctx context.Context, reqCtx *RequestContext) (*RequestContext, error)
-	HandleResponseBodyComplete(ctx context.Context, reqCtx *RequestContext) (*RequestContext, error)
+	HandleRequest(ctx context.Context, reqCtx *RequestContext, inferenceRequestBody *fwkrh.InferenceRequestBody) (*RequestContext, error)
+	HandleResponseHeader(ctx context.Context, reqCtx *RequestContext) *RequestContext
+	HandleResponseBody(ctx context.Context, reqCtx *RequestContext, endOfStream bool) *RequestContext
 	GetRandomEndpoint() *fwkdl.EndpointMetadata
 }
 
@@ -65,8 +82,10 @@ type Datastore interface {
 // Server implements the Envoy external processing server.
 // https://www.envoyproxy.io/docs/envoy/latest/api-v3/service/ext_proc/v3/external_processor.proto
 type StreamingServer struct {
-	datastore Datastore
-	director  Director
+	datastore      Datastore
+	director       Director
+	parser         fwkrh.Parser
+	evictionLookup EvictChannelLookup // optional, set for eviction support
 }
 
 // RequestContext stores context information during the life time of an HTTP request.
@@ -81,17 +100,19 @@ type RequestContext struct {
 	TargetModelName           string
 	FairnessID                string
 	ObjectiveKey              string
+	Priority                  int
 	RequestReceivedTimestamp  time.Time
 	ResponseCompleteTimestamp time.Time
 	RequestSize               int
-	Usage                     fwkrq.Usage
+	Usage                     fwkrh.Usage
 	ResponseSize              int
+	ResponseBodyStarted       bool
 	ResponseComplete          bool
 	ResponseStatusCode        string
 	RequestRunning            bool
 	Request                   *Request
 
-	SchedulingRequest *schedulingtypes.LLMRequest
+	SchedulingRequest *schedulingtypes.InferenceRequest
 
 	RequestState         StreamRequestState
 	modelServerStreaming bool
@@ -127,13 +148,28 @@ const (
 	HeaderResponseResponseComplete   StreamRequestState = 5
 	BodyResponseResponsesComplete    StreamRequestState = 6
 	TrailerResponseResponsesComplete StreamRequestState = 7
+	// RequestEvicted indicates the request was evicted by flow control.
+	// The state machine sends an ImmediateResponse(429) to Envoy.
+	RequestEvicted StreamRequestState = 8
 )
+
+// recvResult holds the result of a srv.Recv() call from the reader goroutine.
+type recvResult struct {
+	req *extProcPb.ProcessingRequest
+	err error
+}
 
 func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer) error {
 	ctx := srv.Context()
 
 	// Start tracing span for the request
-	tracer := otel.Tracer("gateway-api-inference-extension")
+	tracer := otel.Tracer(
+		"gateway-api-inference-extension/epp/extproc",
+		trace.WithInstrumentationVersion(version.BuildRef),
+		trace.WithInstrumentationAttributes(
+			attribute.String("commit-sha", version.CommitSHA),
+		),
+	)
 	ctx, span := tracer.Start(ctx, "gateway.request", trace.WithSpanKind(trace.SpanKindServer))
 	defer span.End()
 
@@ -155,16 +191,47 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 	}
 
 	var body []byte
+	var evictionRequestID string
+
+	// Start a single reader goroutine for the lifetime of the stream.
+	// This avoids spawning a new goroutine per message and allows the main loop to
+	// select on both incoming messages and the eviction channel.
+	recvCh := make(chan recvResult, 1)
+	// Capture the stream context's Done channel before ctx is reassigned in the main loop.
+	// This avoids a data race between the reader goroutine reading ctx and the main loop writing it.
+	streamDone := srv.Context().Done()
+	go func() {
+		for {
+			req, err := srv.Recv()
+			select {
+			case recvCh <- recvResult{req: req, err: err}:
+			case <-streamDone:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// evictCh starts nil — selecting on a nil channel blocks forever.
+	// After scheduling, it is set to the eviction channel, dynamically
+	// enabling eviction listening.
+	var evictCh chan struct{}
 
 	// Create error handling var as each request should only report once for
 	// error metrics. This doesn't cover the error "Cannot receive stream request" because
 	// such errors might happen even though response is processed.
 	var err error
-	defer func(error, *RequestContext) {
+	defer func() {
+		// Clean up eviction channel registration on exit.
+		if s.evictionLookup != nil && evictionRequestID != "" {
+			s.evictionLookup.Deregister(evictionRequestID)
+		}
 		if reqCtx.ResponseStatusCode != "" {
 			metrics.RecordRequestErrCounter(reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.ResponseStatusCode)
 		} else if err != nil {
-			metrics.RecordRequestErrCounter(reqCtx.IncomingModelName, reqCtx.TargetModelName, errutil.CanonicalCode(err))
+			metrics.RecordRequestErrCounter(reqCtx.IncomingModelName, reqCtx.TargetModelName, errcommon.CanonicalCode(err))
 		}
 		if reqCtx.RequestRunning {
 			metrics.DecRunningRequests(reqCtx.IncomingModelName)
@@ -176,41 +243,61 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 			// Use a fresh context as the request context might be canceled (Client Disconnect).
 			// We only need logging from the original context.
 			cleanupCtx := log.IntoContext(context.Background(), logger)
-			if _, err := s.director.HandleResponseBodyComplete(cleanupCtx, reqCtx); err != nil {
-				logger.Error(err, "error in HandleResponseBodyComplete")
-			}
+			s.director.HandleResponseBody(cleanupCtx, reqCtx, true)
 		}
-	}(err, reqCtx)
+	}()
 
 	for {
+		var req *extProcPb.ProcessingRequest
+		var recvErr error
+
+		// Main select: listen for incoming messages, eviction signals, and context cancellation.
+		// evictCh is nil until scheduling completes, so the eviction case blocks forever until then.
 		select {
+		case result := <-recvCh:
+			req = result.req
+			recvErr = result.err
+		case <-evictCh:
+			// Skip if the response already completed — sending ImmediateResponse
+			// after the final body chunk would be a protocol violation.
+			if reqCtx.ResponseComplete {
+				logger.V(logutil.DEBUG).Info("Eviction signal received but response already complete, ignoring",
+					"requestID", evictionRequestID)
+				evictCh = nil // prevent closed channel from firing repeatedly
+				continue
+			}
+			// Eviction triggered — transition to evicted state and let the state machine send the response.
+			logger.Info("Request evicted by flow control", "requestID", evictionRequestID)
+			reqCtx.RequestState = RequestEvicted
+			if sendErr := reqCtx.updateStateAndSendIfNeeded(srv, logger); sendErr != nil {
+				return sendErr
+			}
+			return nil
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
 		}
 
-		req, recvErr := srv.Recv()
 		if recvErr == io.EOF || status.Code(recvErr) == codes.Canceled {
 			return nil
 		}
 		if recvErr != nil {
-			return status.Errorf(codes.Unknown, "cannot receive stream request: %v", err)
+			return status.Errorf(codes.Unknown, "cannot receive stream request: %v", recvErr)
 		}
 
-		reqCtx.Request.Metadata = requtil.ExtractMetadataValues(req)
+		reqCtx.Request.Metadata = envoy.ExtractMetadataValues(req)
 
 		switch v := req.Request.(type) {
 		case *extProcPb.ProcessingRequest_RequestHeaders:
-			requestID := requtil.ExtractHeaderValue(v, requtil.RequestIdHeaderKey)
+			requestID := envoy.ExtractHeaderValue(v, reqcommon.RequestIdHeaderKey)
 			// request ID is a must for maintaining a state per request in plugins that hold internal state and use PluginState.
 			// if request id was not supplied as a header, we generate it ourselves.
 			if len(requestID) == 0 {
 				requestID = uuid.NewString()
 				loggerTrace.Info("RequestID header is not found in the request, generated a request id")
-				reqCtx.Request.Headers[requtil.RequestIdHeaderKey] = requestID // update in headers so director can consume it
+				reqCtx.Request.Headers[reqcommon.RequestIdHeaderKey] = requestID // update in headers so director can consume it
 			}
-			logger = logger.WithValues(requtil.RequestIdHeaderKey, requestID)
-			logger.V(1).Info("EPP received request") // Request ID will be logged too as part of logger context values.
+			logger = logger.WithValues(reqcommon.RequestIdHeaderKey, requestID)
+			logger.V(logutil.DEFAULT).Info("EPP received request") // Request ID will be logged too as part of logger context values.
 			loggerTrace = logger.V(logutil.TRACE)
 			ctx = log.IntoContext(ctx, logger)
 
@@ -229,16 +316,34 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 				reqCtx.RequestSize = len(body)
 				body = []byte{}
 
-				reqCtx, err = s.director.HandleRequest(ctx, reqCtx)
-				if err != nil {
-					logger.V(1).Error(err, "Error handling request")
+				inferenceRequestBody, parseErr := s.parser.ParseRequest(ctx, reqCtx.Request.RawBody, reqCtx.Request.Headers)
+				if parseErr != nil {
+					err = errcommon.Error{Code: errcommon.BadRequest, Msg: parseErr.Error()}
+					logger.Error(err, "Error parsing request")
 					break
 				}
 
-				reqCtx.reqHeaderResp = s.generateRequestHeaderResponse(ctx, reqCtx)
-				reqCtx.reqBodyResp = s.generateRequestBodyResponses(reqCtx.Request.RawBody)
+				reqCtx, err = s.director.HandleRequest(ctx, reqCtx, inferenceRequestBody)
+				if err != nil {
+					logger.Error(err, "Error handling request")
+					break
+				}
 
-				metrics.RecordRequestCounter(reqCtx.IncomingModelName, reqCtx.TargetModelName)
+				// After scheduling, look up the eviction channel for eviction support.
+				// Setting evictCh from nil to a real channel dynamically enables the
+				// eviction case in the main select.
+				if s.evictionLookup != nil {
+					evictionRequestID = reqCtx.Request.Headers[reqcommon.RequestIdHeaderKey]
+					evictCh = s.evictionLookup.Get(evictionRequestID)
+				}
+
+				if reqCtx.SchedulingRequest != nil && reqCtx.SchedulingRequest.Body != nil {
+					reqCtx.modelServerStreaming = reqCtx.SchedulingRequest.Body.Stream
+				}
+
+				reqCtx.reqHeaderResp = s.generateRequestHeaderResponse(ctx, reqCtx)
+				reqCtx.reqBodyResp = envoy.GenerateRequestBodyResponses(reqCtx.Request.RawBody)
+				metrics.RecordRequestCounter(reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.Priority)
 				metrics.RecordRequestSizes(reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.RequestSize)
 			}
 		case *extProcPb.ProcessingRequest_RequestTrailers:
@@ -248,69 +353,46 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 				value := string(header.RawValue)
 				loggerTrace.Info("header", "key", header.Key, "value", value)
 				if header.Key == "status" && value != "200" {
-					reqCtx.ResponseStatusCode = errutil.ModelServerError
+					reqCtx.ResponseStatusCode = errcommon.ModelServerError
 				} else if header.Key == "content-type" && strings.Contains(value, "text/event-stream") {
 					reqCtx.modelServerStreaming = true
 					loggerTrace.Info("model server is streaming response")
 				}
 			}
 			reqCtx.RequestState = ResponseReceived
-
-			var responseErr error
-			reqCtx, responseErr = s.HandleResponseHeaders(ctx, reqCtx, v)
-			if responseErr != nil {
-				if logger.V(logutil.DEBUG).Enabled() {
-					logger.V(logutil.DEBUG).Error(responseErr, "Failed to process response headers", "request", req)
-				} else {
-					logger.V(1).Error(responseErr, "Failed to process response headers")
-				}
-			}
+			reqCtx = s.HandleResponseHeaders(ctx, reqCtx, v)
 			reqCtx.respHeaderResp = s.generateResponseHeaderResponse(reqCtx)
 
 		case *extProcPb.ProcessingRequest_ResponseBody:
-			reqCtx.ResponseComplete = v.ResponseBody.EndOfStream
-			if reqCtx.ResponseComplete {
-				loggerTrace.Info("stream completed")
-				reqCtx.ResponseCompleteTimestamp = time.Now()
-			}
+			endOfStream := v.ResponseBody.EndOfStream
+			chunk := v.ResponseBody.Body
+
 			if reqCtx.modelServerStreaming {
-				// Currently we punt on response parsing if the modelServer is streaming, and we just passthrough.
-				s.HandleResponseBodyModelStreaming(ctx, reqCtx, v.ResponseBody.Body)
-				if v.ResponseBody.EndOfStream {
-					if _, err := s.director.HandleResponseBodyComplete(ctx, reqCtx); err != nil {
-						logger.Error(err, "error in HandleResponseBodyComplete")
-					}
-					metrics.RecordRequestLatencies(ctx, reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.RequestReceivedTimestamp, reqCtx.ResponseCompleteTimestamp)
-					metrics.RecordResponseSizes(reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.ResponseSize)
-					metrics.RecordNormalizedTimePerOutputToken(ctx, reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.RequestReceivedTimestamp, reqCtx.ResponseCompleteTimestamp, reqCtx.Usage.CompletionTokens)
+				if endOfStream {
+					reqCtx.ResponseComplete = true
+					reqCtx.ResponseCompleteTimestamp = time.Now()
 				}
-				reqCtx.respBodyResp = generateResponseBodyResponses(v.ResponseBody.Body, v.ResponseBody.EndOfStream)
+				s.HandleResponseBody(ctx, reqCtx, chunk, endOfStream)
+				// Rewrite the model name in response body back to the original client-facing name.
+				chunk = rewriteModelName(chunk, reqCtx.TargetModelName, reqCtx.IncomingModelName)
+				// For streaming response, we send response chunk back to envoy every time we received it.
+				reqCtx.respBodyResp = generateResponseBodyResponses(chunk, endOfStream, reqCtx.Response.DynamicMetadata)
 			} else {
-				body = append(body, v.ResponseBody.Body...)
-
-				// Message is buffered, we can read and decode.
-				if v.ResponseBody.EndOfStream {
-					reqCtx.ResponseSize = len(body)
-					reqCtx.respBodyResp = generateResponseBodyResponses(body, true)
-
-					var responseErr error
-					reqCtx, responseErr = s.HandleResponseBody(ctx, reqCtx, body)
-					if responseErr != nil {
-						break
-					}
-					metrics.RecordRequestLatencies(ctx, reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.RequestReceivedTimestamp, reqCtx.ResponseCompleteTimestamp)
-					metrics.RecordResponseSizes(reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.ResponseSize)
-					metrics.RecordInputTokens(reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.Usage.PromptTokens)
-					metrics.RecordOutputTokens(reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.Usage.CompletionTokens)
-					cachedToken := 0
-					if reqCtx.Usage.PromptTokenDetails != nil {
-						cachedToken = reqCtx.Usage.PromptTokenDetails.CachedTokens
-					}
-					metrics.RecordPromptCachedTokens(reqCtx.IncomingModelName, reqCtx.TargetModelName, cachedToken)
+				body = append(body, chunk...)
+				if endOfStream {
+					s.finishResponse(ctx, reqCtx, body, reqCtx.modelServerStreaming, true)
 				}
 			}
 		case *extProcPb.ProcessingRequest_ResponseTrailers:
-			// This is currently unused.
+			// For HTTP, the response trailer is not sent. Thus, this case will not be triggered.
+			// For gRPC(over HTTP2), the protocol relies on responseTrialers to determine whether a response is complete.
+			// More info: https://chromium.googlesource.com/external/github.com/grpc/grpc/+/HEAD/doc/PROTOCOL-HTTP2.md#responses
+			s.finishResponse(ctx, reqCtx, body, reqCtx.modelServerStreaming, false)
+			reqCtx.respTrailerResp = &extProcPb.ProcessingResponse{
+				Response: &extProcPb.ProcessingResponse_ResponseTrailers{
+					ResponseTrailers: &extProcPb.TrailersResponse{},
+				},
+			}
 		}
 
 		// Handle the err and fire an immediate response.
@@ -318,14 +400,14 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 			if logger.V(logutil.DEBUG).Enabled() {
 				logger.V(logutil.DEBUG).Error(err, "Failed to process request", "request", req)
 			} else {
-				logger.V(1).Error(err, "Failed to process request")
+				logger.Error(err, "Failed to process request")
 			}
-			resp, err := buildErrResponse(err)
+			resp, err := errcommon.BuildErrResponse(err)
 			if err != nil {
 				return err
 			}
 			if err := srv.Send(resp); err != nil {
-				logger.V(1).Error(err, "Send failed")
+				logger.Error(err, "Send failed")
 				return status.Errorf(codes.Unknown, "failed to send response back to Envoy: %v", err)
 			}
 			return nil
@@ -337,15 +419,71 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 	}
 }
 
-// updateStateAndSendIfNeeded checks state and can send mutiple responses in a single pass, but only if ordered properly.
+// finishResponse ensures all post-response logic, such as metric recording
+// and state updates, is executed exactly once for the request lifecycle.
+func (s *StreamingServer) finishResponse(ctx context.Context, reqCtx *RequestContext, body []byte, modelStreaming bool, setEos bool) {
+	// Return early if the response has already been finished to prevent
+	// duplicate execution of side effects and metrics.
+	if reqCtx.ResponseComplete {
+		return
+	}
+
+	reqCtx.ResponseComplete = true
+	reqCtx.ResponseCompleteTimestamp = time.Now()
+	reqCtx = s.HandleResponseBody(ctx, reqCtx, body, true)
+	if !modelStreaming {
+		// Rewrite the model name in response body back to the original client-facing name.
+		body = rewriteModelName(body, reqCtx.TargetModelName, reqCtx.IncomingModelName)
+		// For non-streaming response, we send response back to envoy after receiving all the response body.
+		reqCtx.respBodyResp = generateResponseBodyResponses(body, setEos, reqCtx.Response.DynamicMetadata)
+	}
+}
+
+// rewriteModelName replaces occurrences of the target (internal) model name with the
+// incoming (client-facing) model name in the response body bytes. This ensures clients
+// see the model name they originally requested, not the internal backend model name.
+// It is a no-op when the names are identical or either is empty.
+func rewriteModelName(body []byte, targetModel, incomingModel string) []byte {
+	if targetModel == "" || incomingModel == "" || targetModel == incomingModel {
+		return body
+	}
+	old := []byte(`"model":"` + targetModel + `"`)
+	new := []byte(`"model":"` + incomingModel + `"`)
+	result := bytes.ReplaceAll(body, old, new)
+	if !bytes.Equal(result, body) {
+		return result
+	}
+	// Also handle the case where JSON has spaces after the colon: "model": "..."
+	old = []byte(`"model": "` + targetModel + `"`)
+	new = []byte(`"model": "` + incomingModel + `"`)
+	return bytes.ReplaceAll(body, old, new)
+}
+
+// updateStateAndSendIfNeeded checks state and can send multiple responses in a single pass, but only if ordered properly.
 // Order of requests matter in FULL_DUPLEX_STREAMING. For both request and response, the order of response sent back MUST be: Header->Body->Trailer, with trailer being optional.
 func (r *RequestContext) updateStateAndSendIfNeeded(srv extProcPb.ExternalProcessor_ProcessServer, logger logr.Logger) error {
 	loggerTrace := logger.V(logutil.TRACE)
+
+	// Handle eviction — send ImmediateResponse(429) to Envoy to reset the upstream connection.
+	if r.RequestState == RequestEvicted {
+		loggerTrace.Info("Sending ImmediateResponse for evicted request")
+		return srv.Send(&extProcPb.ProcessingResponse{
+			Response: &extProcPb.ProcessingResponse_ImmediateResponse{
+				ImmediateResponse: &extProcPb.ImmediateResponse{
+					Status: &envoyTypePb.HttpStatus{
+						Code: envoyTypePb.StatusCode_TooManyRequests,
+					},
+					Body: []byte("request evicted by flow control"),
+				},
+			},
+		})
+	}
+
 	// No switch statement as we could send multiple responses in one pass.
 	if r.RequestState == RequestReceived && r.reqHeaderResp != nil {
 		loggerTrace.Info("Sending request header response", "obj", r.reqHeaderResp)
 		if err := srv.Send(r.reqHeaderResp); err != nil {
-			logger.V(1).Error(err, "error sending response")
+			logger.Error(err, "error sending response")
 			return status.Errorf(codes.Unknown, "failed to send response back to Envoy: %v", err)
 		}
 		r.RequestState = HeaderRequestResponseComplete
@@ -358,7 +496,7 @@ func (r *RequestContext) updateStateAndSendIfNeeded(srv extProcPb.ExternalProces
 				return status.Errorf(codes.Unknown, "failed to send response back to Envoy: %v", err)
 			}
 		}
-		logger.V(1).Info("EPP sent request body response(s) to proxy", "modelName", r.IncomingModelName, "targetModelName", r.TargetModelName)
+		logger.V(logutil.DEFAULT).Info("EPP sent request body response(s) to proxy", "modelName", r.IncomingModelName, "targetModelName", r.TargetModelName)
 		r.RequestState = BodyRequestResponsesComplete
 		metrics.IncRunningRequests(r.IncomingModelName)
 		r.RequestRunning = true
@@ -386,7 +524,7 @@ func (r *RequestContext) updateStateAndSendIfNeeded(srv extProcPb.ExternalProces
 			}
 		}
 		if r.ResponseComplete {
-			logger.V(1).Info("EPP sent response body back to proxy")
+			logger.V(logutil.DEFAULT).Info("EPP sent response body back to proxy")
 			r.RequestState = BodyResponseResponsesComplete
 		}
 		// Dump the response so a new stream message can begin
@@ -396,77 +534,9 @@ func (r *RequestContext) updateStateAndSendIfNeeded(srv extProcPb.ExternalProces
 		// Trailers in requests are not guaranteed
 		if err := srv.Send(r.respTrailerResp); err != nil {
 			return status.Errorf(codes.Unknown, "failed to send response back to Envoy: %v", err)
+		} else {
+			logger.V(logutil.DEBUG).Info("EPP sent trailer back to proxy")
 		}
 	}
 	return nil
-}
-
-func buildErrResponse(err error) (*extProcPb.ProcessingResponse, error) {
-	var resp *extProcPb.ProcessingResponse
-
-	switch errutil.CanonicalCode(err) {
-	// This code can be returned by scheduler when there is no capacity for sheddable
-	// requests.
-	case errutil.InferencePoolResourceExhausted:
-		resp = &extProcPb.ProcessingResponse{
-			Response: &extProcPb.ProcessingResponse_ImmediateResponse{
-				ImmediateResponse: &extProcPb.ImmediateResponse{
-					Status: &envoyTypePb.HttpStatus{
-						Code: envoyTypePb.StatusCode_TooManyRequests,
-					},
-				},
-			},
-		}
-	// This code can be returned by when EPP processes the request and run into server-side errors.
-	case errutil.Internal:
-		resp = &extProcPb.ProcessingResponse{
-			Response: &extProcPb.ProcessingResponse_ImmediateResponse{
-				ImmediateResponse: &extProcPb.ImmediateResponse{
-					Status: &envoyTypePb.HttpStatus{
-						Code: envoyTypePb.StatusCode_InternalServerError,
-					},
-				},
-			},
-		}
-	// This code can be returned by the director when there are no candidate pods for the request scheduling.
-	case errutil.ServiceUnavailable:
-		resp = &extProcPb.ProcessingResponse{
-			Response: &extProcPb.ProcessingResponse_ImmediateResponse{
-				ImmediateResponse: &extProcPb.ImmediateResponse{
-					Status: &envoyTypePb.HttpStatus{
-						Code: envoyTypePb.StatusCode_ServiceUnavailable,
-					},
-				},
-			},
-		}
-	// This code can be returned when users provide invalid json request.
-	case errutil.BadRequest:
-		resp = &extProcPb.ProcessingResponse{
-			Response: &extProcPb.ProcessingResponse_ImmediateResponse{
-				ImmediateResponse: &extProcPb.ImmediateResponse{
-					Status: &envoyTypePb.HttpStatus{
-						Code: envoyTypePb.StatusCode_BadRequest,
-					},
-				},
-			},
-		}
-	case errutil.BadConfiguration:
-		resp = &extProcPb.ProcessingResponse{
-			Response: &extProcPb.ProcessingResponse_ImmediateResponse{
-				ImmediateResponse: &extProcPb.ImmediateResponse{
-					Status: &envoyTypePb.HttpStatus{
-						Code: envoyTypePb.StatusCode_NotFound,
-					},
-				},
-			},
-		}
-	default:
-		return nil, status.Errorf(status.Code(err), "failed to handle request: %v", err)
-	}
-
-	if err.Error() != "" {
-		resp.Response.(*extProcPb.ProcessingResponse_ImmediateResponse).ImmediateResponse.Body = []byte(err.Error())
-	}
-
-	return resp, nil
 }

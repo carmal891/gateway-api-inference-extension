@@ -18,11 +18,14 @@ package datalayer
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"maps"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	fwkdl "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/datalayer"
 	fwkfcmocks "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/flowcontrol/mocks"
 	fwkplugin "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/plugin"
@@ -58,8 +61,25 @@ func (m *mockPrepareRequestDataP) Consumes() map[string]any {
 	return m.consumes
 }
 
-func (m *mockPrepareRequestDataP) PrepareRequestData(ctx context.Context, request *fwksch.LLMRequest, endpoints []fwksch.Endpoint) error {
+func (m *mockPrepareRequestDataP) PrepareRequestData(ctx context.Context, request *fwksch.InferenceRequest, endpoints []fwksch.Endpoint) error {
 	endpoints[0].Put(mockProducedDataKey, &mockProducedDataType{value: 42})
+	return nil
+}
+
+// typedMockPlugin is a DataProducer whose TypedName.Type can be set explicitly,
+// allowing tests to simulate a plugin whose registry type is already present.
+type typedMockPlugin struct {
+	typeName string
+	produces map[string]any
+}
+
+func (m *typedMockPlugin) TypedName() fwkplugin.TypedName {
+	return fwkplugin.TypedName{Name: m.typeName, Type: m.typeName}
+}
+
+func (m *typedMockPlugin) Produces() map[string]any { return m.produces }
+func (m *typedMockPlugin) Consumes() map[string]any { return nil }
+func (m *typedMockPlugin) PrepareRequestData(ctx context.Context, request *fwksch.InferenceRequest, endpoints []fwksch.Endpoint) error {
 	return nil
 }
 
@@ -92,37 +112,38 @@ func TestValidatePluginExecutionOrder(t *testing.T) {
 	consumerFairnessPolicyPlugin := MockConsumerFairnessPolicy{consumes: map[string]any{"keyA": nil}}
 	// Scheduling plugin.
 	consumerSchedulingPlugin := MockSchedulingPlugin{consumes: map[string]any{"keyA": nil}}
-	if _, ok := any(pluginA).(fwkrc.PrepareDataPlugin); !ok {
+	if _, ok := any(pluginA).(fwkrc.DataProducer); !ok {
 		t.Fatalf("pluginA should implement PrepareDataPlugin")
 	}
 
 	testCases := []struct {
 		name        string
 		plugins     []fwkplugin.Plugin
-		expectError bool
+		expectedErr string
 	}{
 		{
 			name:        "Plugins with no dependencies",
 			plugins:     []fwkplugin.Plugin{pluginA},
-			expectError: false,
+			expectedErr: "",
 		},
 		{
 			name:        "FC depends on a request control plugin (invalid layer execution order)",
 			plugins:     []fwkplugin.Plugin{pluginA, &consumerFairnessPolicyPlugin},
-			expectError: true,
+			expectedErr: "invalid plugin layer execution order",
 		},
 		{
 			name:        "Scheduling plugin depends on a request control plugin",
 			plugins:     []fwkplugin.Plugin{pluginA, &consumerSchedulingPlugin},
-			expectError: false,
+			expectedErr: "",
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := ValidateAndOrderDataDependencies(tc.plugins)
-			if tc.expectError {
+			if tc.expectedErr != "" {
 				assert.Error(t, err)
+				assert.Contains(t, err.Error(), tc.expectedErr)
 				return
 			}
 			assert.NoError(t, err)
@@ -145,59 +166,72 @@ func TestDAGAndTopologicalOrder(t *testing.T) {
 	pluginZ1 := &mockPrepareRequestDataP{name: "Z1", produces: map[string]any{"keyZ": int(0)}}
 	pluginZ2 := &mockPrepareRequestDataP{name: "Z2", consumes: map[string]any{"keyZ": string("")}}
 
+	// Same type different pointers.
+	pluginP1 := &mockPrepareRequestDataP{name: "P1", produces: map[string]any{"keyP": &mockProducedDataType{}}}
+	pluginP2 := &mockPrepareRequestDataP{name: "P2", consumes: map[string]any{"keyP": &mockProducedDataType{}}}
+
 	testCases := []struct {
 		name        string
-		plugins     []fwkrc.PrepareDataPlugin
+		plugins     []fwkrc.DataProducer
 		expectedDAG map[string][]string
-		expectError bool
+		expectedErr string
 	}{
 		{
 			name:        "No plugins",
-			plugins:     []fwkrc.PrepareDataPlugin{},
+			plugins:     []fwkrc.DataProducer{},
 			expectedDAG: map[string][]string{},
-			expectError: false,
+			expectedErr: "",
 		},
 		{
 			name:    "Plugins with no dependencies",
-			plugins: []fwkrc.PrepareDataPlugin{pluginA, pluginE},
+			plugins: []fwkrc.DataProducer{pluginA, pluginE},
 			expectedDAG: map[string][]string{
 				"A/mock": {},
 				"E/mock": {},
 			},
-			expectError: false,
+			expectedErr: "",
 		},
 		{
 			name:    "Simple linear dependency (C -> B -> A)",
-			plugins: []fwkrc.PrepareDataPlugin{pluginA, pluginB, pluginC},
+			plugins: []fwkrc.DataProducer{pluginA, pluginB, pluginC},
 			expectedDAG: map[string][]string{
 				"A/mock": {},
 				"B/mock": {"A/mock"},
 				"C/mock": {"B/mock"},
 			},
-			expectError: false,
+			expectedErr: "",
 		},
 		{
 			name:    "DAG with multiple dependencies (B -> A, D -> A, E independent)",
-			plugins: []fwkrc.PrepareDataPlugin{pluginA, pluginB, pluginD, pluginE},
+			plugins: []fwkrc.DataProducer{pluginA, pluginB, pluginD, pluginE},
 			expectedDAG: map[string][]string{
 				"A/mock": {},
 				"B/mock": {"A/mock"},
 				"D/mock": {"A/mock"},
 				"E/mock": {},
 			},
-			expectError: false,
+			expectedErr: "",
 		},
 		{
 			name:        "Graph with a cycle (X -> Y, Y -> X)",
-			plugins:     []fwkrc.PrepareDataPlugin{pluginX, pluginY},
+			plugins:     []fwkrc.DataProducer{pluginX, pluginY},
 			expectedDAG: nil,
-			expectError: true,
+			expectedErr: "cycle detected",
 		},
 		{
 			name:        "Data type mismatch between produced and consumed data",
-			plugins:     []fwkrc.PrepareDataPlugin{pluginZ1, pluginZ2},
+			plugins:     []fwkrc.DataProducer{pluginZ1, pluginZ2},
 			expectedDAG: nil,
-			expectError: true,
+			expectedErr: "data type mismatch between produced and consumed data",
+		},
+		{
+			name:    "Same type different pointers (should succeed)",
+			plugins: []fwkrc.DataProducer{pluginP1, pluginP2},
+			expectedDAG: map[string][]string{
+				"P1/mock": {},
+				"P2/mock": {"P1/mock"},
+			},
+			expectedErr: "",
 		},
 	}
 
@@ -215,16 +249,18 @@ func TestDAGAndTopologicalOrder(t *testing.T) {
 			}
 			dag, err := buildDAG(producers, consumers)
 			if err != nil {
-				if tc.expectError {
+				if tc.expectedErr != "" {
 					assert.Error(t, err)
+					assert.Contains(t, err.Error(), tc.expectedErr)
 					return
 				}
+				assert.NoError(t, err)
 			}
 			orderedPlugins, err := topologicalSort(dag)
 
-			if tc.expectError {
+			if tc.expectedErr != "" {
 				assert.Error(t, err)
-				assert.Contains(t, err.Error(), "cycle detected")
+				assert.Contains(t, err.Error(), tc.expectedErr)
 				return
 			}
 			assert.NoError(t, err)
@@ -233,15 +269,144 @@ func TestDAGAndTopologicalOrder(t *testing.T) {
 			normalizedDAG := make(map[string][]string)
 			maps.Copy(normalizedDAG, dag)
 			normalizedExpectedDAG := make(map[string][]string)
-			for k, v := range tc.expectedDAG {
-				normalizedExpectedDAG[k] = v
-			}
+			maps.Copy(normalizedExpectedDAG, tc.expectedDAG)
 
 			if diff := cmp.Diff(normalizedExpectedDAG, normalizedDAG); diff != "" {
 				t.Errorf("prepareDataGraph() mismatch (-want +got):\n%s", diff)
 			}
 
 			assertTopologicalOrder(t, dag, orderedPlugins)
+		})
+	}
+}
+
+func TestCreateMissingDataProducers(t *testing.T) {
+	const (
+		keyA = "keyA"
+		keyB = "keyB"
+	)
+
+	// A DataProducer that produces keyA.
+	producerTypeA := "producer-a"
+	producerAFactory := fwkplugin.FactoryFunc(func(name string, _ json.RawMessage, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
+		return &mockPrepareRequestDataP{name: name, produces: map[string]any{keyA: nil}}, nil
+	})
+
+	// A DataProducer that produces keyB.
+	producerTypeB := "producer-b"
+	producerBFactory := fwkplugin.FactoryFunc(func(name string, _ json.RawMessage, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
+		return &mockPrepareRequestDataP{name: name, produces: map[string]any{keyB: nil}}, nil
+	})
+
+	// A non-ProducerPlugin registry entry (e.g. a scheduling scorer).
+	nonProducerType := "non-producer"
+	nonProducerFactory := fwkplugin.FactoryFunc(func(name string, _ json.RawMessage, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
+		return &MockSchedulingPlugin{consumes: map[string]any{keyA: nil}}, nil
+	})
+
+	// A factory that always fails.
+	failingType := "failing"
+	failingFactory := fwkplugin.FactoryFunc(func(name string, _ json.RawMessage, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
+		return nil, errors.New("requires params")
+	})
+
+	handle := fwkplugin.NewEppHandle(context.Background(), func() []k8stypes.NamespacedName { return nil })
+
+	testCases := []struct {
+		name                    string
+		existingPlugins         []fwkplugin.Plugin
+		defaultProducerRegistry map[string]string
+		factoryRegistry         map[string]fwkplugin.FactoryFunc
+		wantTypes               []string // TypedName.Type of expected auto-created producers
+		wantErr                 bool
+	}{
+		{
+			name: "creates producer for missing consumed key",
+			existingPlugins: []fwkplugin.Plugin{
+				&MockSchedulingPlugin{consumes: map[string]any{keyA: nil}},
+			},
+			defaultProducerRegistry: map[string]string{keyA: producerTypeA},
+			factoryRegistry:         map[string]fwkplugin.FactoryFunc{producerTypeA: producerAFactory},
+			wantTypes:               []string{producerTypeA},
+		},
+		{
+			name: "no missing keys - nothing created",
+			existingPlugins: []fwkplugin.Plugin{
+				&mockPrepareRequestDataP{name: "existing-a", produces: map[string]any{keyA: nil}},
+				&MockSchedulingPlugin{consumes: map[string]any{keyA: nil}},
+			},
+			defaultProducerRegistry: map[string]string{keyA: producerTypeA},
+			factoryRegistry:         map[string]fwkplugin.FactoryFunc{producerTypeA: producerAFactory},
+			wantTypes:               nil,
+		},
+		{
+			name: "producer already present by type - not duplicated",
+			existingPlugins: []fwkplugin.Plugin{
+				// Simulate a plugin whose type matches the registry key.
+				&typedMockPlugin{typeName: producerTypeA, produces: map[string]any{keyA: nil}},
+				&MockSchedulingPlugin{consumes: map[string]any{keyA: nil}},
+			},
+			defaultProducerRegistry: map[string]string{keyA: producerTypeA},
+			factoryRegistry:         map[string]fwkplugin.FactoryFunc{producerTypeA: producerAFactory},
+			wantTypes:               nil,
+		},
+		{
+			name: "failing factory returns error",
+			existingPlugins: []fwkplugin.Plugin{
+				&MockSchedulingPlugin{consumes: map[string]any{keyA: nil}},
+			},
+			defaultProducerRegistry: map[string]string{keyA: failingType},
+			factoryRegistry:         map[string]fwkplugin.FactoryFunc{failingType: failingFactory},
+			wantErr:                 true,
+		},
+		{
+			name: "non-ProducerPlugin registry entry is skipped",
+			existingPlugins: []fwkplugin.Plugin{
+				&MockSchedulingPlugin{consumes: map[string]any{keyA: nil}},
+			},
+			defaultProducerRegistry: map[string]string{keyA: nonProducerType},
+			factoryRegistry:         map[string]fwkplugin.FactoryFunc{nonProducerType: nonProducerFactory},
+			wantTypes:               nil,
+		},
+		{
+			name: "only relevant producer is created among multiple registry entries",
+			existingPlugins: []fwkplugin.Plugin{
+				&MockSchedulingPlugin{consumes: map[string]any{keyA: nil}},
+			},
+			defaultProducerRegistry: map[string]string{keyA: producerTypeA, keyB: producerTypeB},
+			factoryRegistry: map[string]fwkplugin.FactoryFunc{
+				producerTypeA: producerAFactory,
+				producerTypeB: producerBFactory,
+			},
+			wantTypes: []string{producerTypeA},
+		},
+		{
+			name:                    "no consumers - nothing created",
+			existingPlugins:         []fwkplugin.Plugin{},
+			defaultProducerRegistry: map[string]string{keyA: producerTypeA},
+			factoryRegistry:         map[string]fwkplugin.FactoryFunc{producerTypeA: producerAFactory},
+			wantTypes:               nil,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := CreateMissingDataProducers(tc.existingPlugins, tc.defaultProducerRegistry, tc.factoryRegistry, handle)
+
+			if tc.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+
+			// The auto-created plugin is named after its registry type (the pluginType
+			// passed to the factory), so we compare by name.
+			gotNames := make([]string, 0, len(result))
+			for _, p := range result {
+				gotNames = append(gotNames, p.TypedName().Name)
+			}
+
+			assert.ElementsMatch(t, tc.wantTypes, gotNames)
 		})
 	}
 }
