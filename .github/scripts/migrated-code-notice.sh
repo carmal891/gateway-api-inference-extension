@@ -99,5 +99,11 @@ ${file_list}
 
 Maintainers: not closed by CI. Review for valid exceptions (removals, security fixes, docs) before closing."
 
+if [[ "${DRY_RUN:-}" == "true" ]]; then
+  echo "--- dry run: comment that would be posted on PR #${PR_NUMBER} ---"
+  echo "$comment"
+  exit 0
+fi
+
 gh pr comment "$PR_NUMBER" --body "$comment"
 echo "Posted migration notice on PR #${PR_NUMBER}."
