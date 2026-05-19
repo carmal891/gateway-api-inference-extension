@@ -18,6 +18,8 @@ package flowcontrol
 
 import (
 	"time"
+
+	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/scheduling"
 )
 
 // FlowControlRequest is the contract for an incoming request submitted to the `controller.FlowController`. It
@@ -37,6 +39,12 @@ type FlowControlRequest interface {
 	// for managing byte-based capacity limits and for `contracts.FlowRegistry` statistics.
 	ByteSize() uint64
 
+	// InferenceRequest returns the inference request passed to the scheduling layer.
+	InferenceRequest() *scheduling.InferenceRequest
+
+	// ReceivedTimestamp returns the timestamp when the request was received by the server.
+	ReceivedTimestamp() time.Time
+
 	// InitialEffectiveTTL returns the suggested Time-To-Live for this request.
 	// This value is treated as a hint; the `controller.FlowController` may override it based on its own configuration or
 	// policies. A zero value indicates the request has no specific TTL preference, and a system-wide default should be
@@ -49,7 +57,7 @@ type FlowControlRequest interface {
 	ID() string
 
 	// GetMetadata returns the opaque metadata associated with the request (e.g., header-derived context, subset filters).
-	// This data is passed transparently to components like the contracts.PodLocator to resolve resources (candidate pods)
+	// This data is passed transparently to components like contracts.EndpointCandidates to resolve resources (endpoint candidates)
 	// lazily during the dispatch cycle.
 	GetMetadata() map[string]any
 
@@ -59,7 +67,7 @@ type FlowControlRequest interface {
 	// This is used for observability (metrics labeling) to correlate queue depth with specific backend pools.
 	InferencePoolName() string
 
-	// ModelName returns the name of the base model being requested (e.g., "llama-2-70b").
+	// ModelName returns the name of the base model being requested (e.g., "qwen3-32b").
 	ModelName() string
 
 	// TargetModelName returns the name of the specific adapter or traffic target (e.g., "finance-lora-v1").

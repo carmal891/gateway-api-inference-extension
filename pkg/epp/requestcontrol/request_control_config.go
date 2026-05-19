@@ -24,23 +24,21 @@ import (
 // NewConfig creates a new Config object and returns its pointer.
 func NewConfig() *Config {
 	return &Config{
-		admissionPlugins:         []fwk.AdmissionPlugin{},
-		prepareDataPlugins:       []fwk.PrepareDataPlugin{},
+		admissionPlugins:         []fwk.Admitter{},
+		prepareDataPlugins:       []fwk.DataProducer{},
 		preRequestPlugins:        []fwk.PreRequest{},
-		responseReceivedPlugins:  []fwk.ResponseReceived{},
-		responseStreamingPlugins: []fwk.ResponseStreaming{},
-		responseCompletePlugins:  []fwk.ResponseComplete{},
+		responseReceivedPlugins:  []fwk.ResponseHeaderProcessor{},
+		responseStreamingPlugins: []fwk.ResponseBodyProcessor{},
 	}
 }
 
 // Config provides a configuration for the requestcontrol plugins.
 type Config struct {
-	admissionPlugins         []fwk.AdmissionPlugin
-	prepareDataPlugins       []fwk.PrepareDataPlugin
+	admissionPlugins         []fwk.Admitter
+	prepareDataPlugins       []fwk.DataProducer
 	preRequestPlugins        []fwk.PreRequest
-	responseReceivedPlugins  []fwk.ResponseReceived
-	responseStreamingPlugins []fwk.ResponseStreaming
-	responseCompletePlugins  []fwk.ResponseComplete
+	responseReceivedPlugins  []fwk.ResponseHeaderProcessor
+	responseStreamingPlugins []fwk.ResponseBodyProcessor
 }
 
 // WithPreRequestPlugins sets the given plugins as the PreRequest plugins.
@@ -52,33 +50,26 @@ func (c *Config) WithPreRequestPlugins(plugins ...fwk.PreRequest) *Config {
 
 // WithResponseReceivedPlugins sets the given plugins as the ResponseReceived plugins.
 // If the Config has ResponseReceived plugins already, this call replaces the existing plugins with the given ones.
-func (c *Config) WithResponseReceivedPlugins(plugins ...fwk.ResponseReceived) *Config {
+func (c *Config) WithResponseReceivedPlugins(plugins ...fwk.ResponseHeaderProcessor) *Config {
 	c.responseReceivedPlugins = plugins
 	return c
 }
 
 // WithResponseStreamingPlugins sets the given plugins as the ResponseStreaming plugins.
 // If the Config has ResponseStreaming plugins already, this call replaces the existing plugins with the given ones.
-func (c *Config) WithResponseStreamingPlugins(plugins ...fwk.ResponseStreaming) *Config {
+func (c *Config) WithResponseStreamingPlugins(plugins ...fwk.ResponseBodyProcessor) *Config {
 	c.responseStreamingPlugins = plugins
 	return c
 }
 
-// WithResponseCompletePlugins sets the given plugins as the ResponseComplete plugins.
-// If the Config has ResponseComplete plugins already, this call replaces the existing plugins with the given ones.
-func (c *Config) WithResponseCompletePlugins(plugins ...fwk.ResponseComplete) *Config {
-	c.responseCompletePlugins = plugins
-	return c
-}
-
 // WithPrepareDataPlugins sets the given plugins as the PrepareData plugins.
-func (c *Config) WithPrepareDataPlugins(plugins ...fwk.PrepareDataPlugin) *Config {
+func (c *Config) WithPrepareDataPlugins(plugins ...fwk.DataProducer) *Config {
 	c.prepareDataPlugins = plugins
 	return c
 }
 
 // WithAdmissionPlugins sets the given plugins as the AdmitRequest plugins.
-func (c *Config) WithAdmissionPlugins(plugins ...fwk.AdmissionPlugin) *Config {
+func (c *Config) WithAdmissionPlugins(plugins ...fwk.Admitter) *Config {
 	c.admissionPlugins = plugins
 	return c
 }
@@ -91,19 +82,16 @@ func (c *Config) AddPlugins(pluginObjects ...plugin.Plugin) {
 		if preRequestPlugin, ok := plugin.(fwk.PreRequest); ok {
 			c.preRequestPlugins = append(c.preRequestPlugins, preRequestPlugin)
 		}
-		if responseReceivedPlugin, ok := plugin.(fwk.ResponseReceived); ok {
+		if responseReceivedPlugin, ok := plugin.(fwk.ResponseHeaderProcessor); ok {
 			c.responseReceivedPlugins = append(c.responseReceivedPlugins, responseReceivedPlugin)
 		}
-		if responseStreamingPlugin, ok := plugin.(fwk.ResponseStreaming); ok {
+		if responseStreamingPlugin, ok := plugin.(fwk.ResponseBodyProcessor); ok {
 			c.responseStreamingPlugins = append(c.responseStreamingPlugins, responseStreamingPlugin)
 		}
-		if responseCompletePlugin, ok := plugin.(fwk.ResponseComplete); ok {
-			c.responseCompletePlugins = append(c.responseCompletePlugins, responseCompletePlugin)
-		}
-		if prepareDataPlugin, ok := plugin.(fwk.PrepareDataPlugin); ok {
+		if prepareDataPlugin, ok := plugin.(fwk.DataProducer); ok {
 			c.prepareDataPlugins = append(c.prepareDataPlugins, prepareDataPlugin)
 		}
-		if admissionPlugin, ok := plugin.(fwk.AdmissionPlugin); ok {
+		if admissionPlugin, ok := plugin.(fwk.Admitter); ok {
 			c.admissionPlugins = append(c.admissionPlugins, admissionPlugin)
 		}
 	}
@@ -111,8 +99,8 @@ func (c *Config) AddPlugins(pluginObjects ...plugin.Plugin) {
 
 // OrderPrepareDataPlugins reorders the prepareDataPlugins in the Config based on the given sorted plugin names.
 func (c *Config) OrderPrepareDataPlugins(sortedPluginNames []string) {
-	sortedPlugins := make([]fwk.PrepareDataPlugin, 0, len(sortedPluginNames))
-	nameToPlugin := make(map[string]fwk.PrepareDataPlugin)
+	sortedPlugins := make([]fwk.DataProducer, 0, len(sortedPluginNames))
+	nameToPlugin := make(map[string]fwk.DataProducer)
 	for _, plugin := range c.prepareDataPlugins {
 		nameToPlugin[plugin.TypedName().String()] = plugin
 	}

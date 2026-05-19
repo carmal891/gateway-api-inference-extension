@@ -22,12 +22,14 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -38,18 +40,20 @@ import (
 
 	v1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 	"sigs.k8s.io/gateway-api-inference-extension/apix/v1alpha2"
+	errcommon "sigs.k8s.io/gateway-api-inference-extension/pkg/common/error"
 	logutil "sigs.k8s.io/gateway-api-inference-extension/pkg/common/observability/logging"
+	reqcommon "sigs.k8s.io/gateway-api-inference-extension/pkg/common/request"
 	backendmetrics "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/backend/metrics"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/datalayer"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/datastore"
 	fwkdl "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/datalayer"
 	fwkplugin "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/plugin"
 	fwk "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/requestcontrol"
+	fwkrh "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/requesthandling"
 	fwksched "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/scheduling"
+	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/plugins/requesthandling/parsers/openai"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/handlers"
-	errutil "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/util/error"
 	poolutil "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/util/pool"
-	requtil "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/util/request"
 	testutil "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/util/testing"
 )
 
@@ -73,7 +77,7 @@ type mockScheduler struct {
 	dataProduced    bool // denotes whether data production is expected.
 }
 
-func (m *mockScheduler) Schedule(_ context.Context, _ *fwksched.LLMRequest, endpoints []fwksched.Endpoint) (*fwksched.SchedulingResult, error) {
+func (m *mockScheduler) Schedule(_ context.Context, _ *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) (*fwksched.SchedulingResult, error) {
 	if endpoints != nil && m.dataProduced {
 		data, ok := endpoints[0].Get(mockProducedDataKey)
 		if !ok || data.(mockProducedDataType).value != 42 {
@@ -84,7 +88,7 @@ func (m *mockScheduler) Schedule(_ context.Context, _ *fwksched.LLMRequest, endp
 }
 
 type mockDatastore struct {
-	pods     []backendmetrics.PodMetrics
+	pods     []fwkdl.Endpoint
 	rewrites []*v1alpha2.InferenceModelRewrite
 }
 
@@ -94,8 +98,8 @@ func (ds *mockDatastore) PoolGet() (*datalayer.EndpointPool, error) {
 func (ds *mockDatastore) ObjectiveGet(_ string) *v1alpha2.InferenceObjective {
 	return nil
 }
-func (ds *mockDatastore) PodList(predicate func(backendmetrics.PodMetrics) bool) []backendmetrics.PodMetrics {
-	res := []backendmetrics.PodMetrics{}
+func (ds *mockDatastore) PodList(predicate func(fwkdl.Endpoint) bool) []fwkdl.Endpoint {
+	res := []fwkdl.Endpoint{}
 	for _, pod := range ds.pods {
 		if predicate(pod) {
 			res = append(res, pod)
@@ -123,7 +127,7 @@ func (m *mockPrepareDataPlugin) Consumes() map[string]any {
 	return m.consumes
 }
 
-func (m *mockPrepareDataPlugin) PrepareRequestData(ctx context.Context, request *fwksched.LLMRequest, endpoints []fwksched.Endpoint) error {
+func (m *mockPrepareDataPlugin) PrepareRequestData(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) error {
 	endpoints[0].Put(mockProducedDataKey, mockProducedDataType{value: 42})
 	return nil
 }
@@ -152,8 +156,23 @@ func (m *mockAdmissionPlugin) TypedName() fwkplugin.TypedName {
 	return m.typedName
 }
 
-func (m *mockAdmissionPlugin) AdmitRequest(ctx context.Context, request *fwksched.LLMRequest, endpoints []fwksched.Endpoint) error {
+func (m *mockAdmissionPlugin) AdmitRequest(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) error {
 	return m.denialError
+}
+
+type mockPreRequestPlugin struct {
+	name     string
+	modifyFn func(request *fwksched.InferenceRequest)
+}
+
+func (m *mockPreRequestPlugin) TypedName() fwkplugin.TypedName {
+	return fwkplugin.TypedName{Name: m.name, Type: "mock"}
+}
+
+func (m *mockPreRequestPlugin) PreRequest(ctx context.Context, request *fwksched.InferenceRequest, schedulingResult *fwksched.SchedulingResult) {
+	if m.modifyFn != nil {
+		m.modifyFn(request)
+	}
 }
 
 type mockProducedDataType struct {
@@ -298,13 +317,15 @@ func TestDirector_HandleRequest(t *testing.T) {
 		mockAdmissionController *mockAdmissionController
 		inferenceObjectiveName  string
 		schedulerMockSetup      func(m *mockScheduler)
-		initialTargetModelName  string                   // Initial target model in the reqCtx.
-		wantErrCode             string                   // Expected errutil code string
+		initialTargetModelName  string // Initial target model in the reqCtx.
+		parser                  fwkrh.Parser
+		wantErrCode             string                   // Expected errcommon code string
 		wantReqCtx              *handlers.RequestContext // Fields to check in the returned RequestContext
-		wantMutatedBodyModel    string                   // Expected model in reqCtx.Request.Body after PostDispatch
 		targetModelName         string                   // Expected model name after target model resolution
 		admitRequestDenialError error                    // Expected denial error from admission plugin
 		prepareDataPlugin       *mockPrepareDataPlugin
+		preRequestPlugin        *mockPreRequestPlugin
+		wantMutatedBody         map[string]any
 	}{
 		{
 			name: "successful completions request",
@@ -328,8 +349,48 @@ func TestDirector_HandleRequest(t *testing.T) {
 				},
 				TargetEndpoint: "192.168.1.100:8000,192.168.2.100:8000,192.168.4.100:8000",
 			},
-			wantMutatedBodyModel:   model,
+			wantMutatedBody: map[string]any{
+				"model":  model,
+				"prompt": "critical prompt",
+			},
 			inferenceObjectiveName: objectiveName,
+		},
+		{
+			name: "successful request with preRequest plugin adding key",
+			reqBodyMap: map[string]any{
+				"model":  model,
+				"prompt": "original prompt",
+			},
+			mockAdmissionController: &mockAdmissionController{admitErr: nil},
+			schedulerMockSetup: func(m *mockScheduler) {
+				m.scheduleResults = defaultSuccessfulScheduleResults
+			},
+			initialTargetModelName: model,
+			wantReqCtx: &handlers.RequestContext{
+				ObjectiveKey:    objectiveName,
+				TargetModelName: model,
+				TargetPod: &fwkdl.EndpointMetadata{
+					NamespacedName: types.NamespacedName{Namespace: "default", Name: "pod1"},
+					Address:        "192.168.1.100",
+					Port:           "8000",
+					MetricsHost:    "192.168.1.100:8000",
+				},
+				TargetEndpoint: "192.168.1.100:8000,192.168.2.100:8000,192.168.4.100:8000",
+			},
+			wantMutatedBody: map[string]any{
+				"model":   model,
+				"prompt":  "original prompt",
+				"new_key": "new_value",
+			},
+			inferenceObjectiveName: objectiveName,
+			preRequestPlugin: &mockPreRequestPlugin{
+				name: "test-pre-request-plugin",
+				modifyFn: func(request *fwksched.InferenceRequest) {
+					if payloadMap, ok := request.Body.Payload.(fwkrh.PayloadMap); ok {
+						payloadMap["new_key"] = "new_value"
+					}
+				},
+			},
 		}, {
 			name: "successful request with model rewrite",
 			reqBodyMap: map[string]any{
@@ -352,7 +413,10 @@ func TestDirector_HandleRequest(t *testing.T) {
 				},
 				TargetEndpoint: "192.168.1.100:8000,192.168.2.100:8000,192.168.4.100:8000",
 			},
-			wantMutatedBodyModel:   modelRewritten,
+			wantMutatedBody: map[string]any{
+				"model":  modelRewritten,
+				"prompt": "some prompt",
+			},
 			inferenceObjectiveName: model,
 		}, {
 			name: "successful chat completions request",
@@ -380,8 +444,16 @@ func TestDirector_HandleRequest(t *testing.T) {
 				},
 				TargetEndpoint: "192.168.1.100:8000,192.168.2.100:8000,192.168.4.100:8000",
 			},
-			wantMutatedBodyModel: model,
-			targetModelName:      model,
+			wantMutatedBody: map[string]any{
+				"model": model,
+				"messages": []any{
+					map[string]any{
+						"role":    "user",
+						"content": "critical prompt",
+					},
+				},
+			},
+			targetModelName: model,
 		},
 		{
 			name: "successful chat completions request with prepare data plugins",
@@ -409,9 +481,17 @@ func TestDirector_HandleRequest(t *testing.T) {
 				},
 				TargetEndpoint: "192.168.1.100:8000,192.168.2.100:8000,192.168.4.100:8000",
 			},
-			wantMutatedBodyModel: model,
-			targetModelName:      model,
-			prepareDataPlugin:    newMockPrepareDataPlugin("test-plugin"),
+			wantMutatedBody: map[string]any{
+				"model": model,
+				"messages": []any{
+					map[string]any{
+						"role":    "user",
+						"content": "critical prompt",
+					},
+				},
+			},
+			targetModelName:   model,
+			prepareDataPlugin: newMockPrepareDataPlugin("test-plugin"),
 		},
 		{
 			name: "successful chat completions request with admit request plugins",
@@ -438,7 +518,15 @@ func TestDirector_HandleRequest(t *testing.T) {
 				},
 				TargetEndpoint: "192.168.1.100:8000,192.168.2.100:8000,192.168.4.100:8000",
 			},
-			wantMutatedBodyModel:    model,
+			wantMutatedBody: map[string]any{
+				"model": model,
+				"messages": []any{
+					map[string]any{
+						"role":    "user",
+						"content": "critical prompt",
+					},
+				},
+			},
 			targetModelName:         model,
 			admitRequestDenialError: nil,
 		},
@@ -457,10 +545,18 @@ func TestDirector_HandleRequest(t *testing.T) {
 			schedulerMockSetup: func(m *mockScheduler) {
 				m.scheduleResults = defaultSuccessfulScheduleResults
 			},
-			wantMutatedBodyModel:    model,
+			wantMutatedBody: map[string]any{
+				"model": model,
+				"messages": []any{
+					map[string]any{
+						"role":    "user",
+						"content": "critical prompt",
+					},
+				},
+			},
 			targetModelName:         model,
 			admitRequestDenialError: errors.New("denied by admit plugin"),
-			wantErrCode:             errutil.Internal,
+			wantErrCode:             errcommon.Internal,
 		},
 		{
 			name: "successful chat completions request with multiple messages",
@@ -516,7 +612,10 @@ func TestDirector_HandleRequest(t *testing.T) {
 				},
 				TargetEndpoint: "192.168.1.100:8000,192.168.2.100:8000,192.168.4.100:8000",
 			},
-			wantMutatedBodyModel:   "resolved-target-model-A",
+			wantMutatedBody: map[string]any{
+				"model":  "resolved-target-model-A",
+				"prompt": "prompt for target resolution",
+			},
 			inferenceObjectiveName: objectiveNameResolve,
 		},
 		{
@@ -536,7 +635,10 @@ func TestDirector_HandleRequest(t *testing.T) {
 				},
 				TargetEndpoint: "192.168.1.100:8000,192.168.2.100:8000,192.168.4.100:8000",
 			},
-			wantMutatedBodyModel: "food-review-1",
+			wantMutatedBody: map[string]any{
+				"model":  "food-review-1",
+				"prompt": "test prompt",
+			},
 			reqBodyMap: map[string]any{
 				"model":  "food-review-1",
 				"prompt": "test prompt",
@@ -551,19 +653,19 @@ func TestDirector_HandleRequest(t *testing.T) {
 				"prompt": "sheddable prompt",
 			},
 			inferenceObjectiveName:  objectiveNameSheddable,
-			mockAdmissionController: &mockAdmissionController{admitErr: errutil.Error{Code: errutil.InferencePoolResourceExhausted, Msg: "simulated admission rejection"}},
-			wantErrCode:             errutil.InferencePoolResourceExhausted,
+			mockAdmissionController: &mockAdmissionController{admitErr: errcommon.Error{Code: errcommon.ResourceExhausted, Msg: "simulated admission rejection"}},
+			wantErrCode:             errcommon.ResourceExhausted,
 		},
 		{
 			name:                    "model not found, expect err",
 			reqBodyMap:              map[string]any{"prompt": "p"},
 			mockAdmissionController: &mockAdmissionController{admitErr: nil},
-			wantErrCode:             errutil.BadRequest,
+			wantErrCode:             errcommon.BadRequest,
 		},
 		{
 			name:        "prompt or messages not found, expect err",
 			reqBodyMap:  map[string]any{"model": model},
-			wantErrCode: errutil.BadRequest,
+			wantErrCode: errcommon.BadRequest,
 		},
 		{
 			name: "empty messages, expect err",
@@ -571,7 +673,7 @@ func TestDirector_HandleRequest(t *testing.T) {
 				"model":    model,
 				"messages": []any{},
 			},
-			wantErrCode: errutil.BadRequest,
+			wantErrCode: errcommon.BadRequest,
 		},
 		{
 			name: "scheduler returns error",
@@ -583,7 +685,7 @@ func TestDirector_HandleRequest(t *testing.T) {
 			schedulerMockSetup: func(m *mockScheduler) {
 				m.scheduleErr = errors.New("simulated scheduler failure")
 			},
-			wantErrCode:            errutil.InferencePoolResourceExhausted,
+			wantErrCode:            errcommon.ResourceExhausted,
 			inferenceObjectiveName: objectiveName,
 		},
 		{
@@ -597,7 +699,7 @@ func TestDirector_HandleRequest(t *testing.T) {
 				m.scheduleResults = nil
 				m.scheduleErr = nil
 			},
-			wantErrCode:            errutil.Internal,
+			wantErrCode:            errcommon.Internal,
 			inferenceObjectiveName: objectiveName,
 		},
 	}
@@ -605,7 +707,7 @@ func TestDirector_HandleRequest(t *testing.T) {
 	period := time.Second
 	factories := []datalayer.EndpointFactory{
 		backendmetrics.NewPodMetricsFactory(&backendmetrics.FakePodMetricsClient{}, period),
-		datalayer.NewEndpointFactory([]fwkdl.DataSource{&datalayer.FakeDataSource{}}, period),
+		datalayer.NewTestRuntime(t, period),
 	}
 	for _, epf := range factories {
 		// Datastore setup
@@ -637,7 +739,7 @@ func TestDirector_HandleRequest(t *testing.T) {
 					Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
 				},
 			}
-			ds.PodUpdateOrAddIfNotExist(testPod)
+			ds.PodUpdateOrAddIfNotExist(ctx, testPod)
 		}
 
 		for _, test := range tests {
@@ -650,23 +752,26 @@ func TestDirector_HandleRequest(t *testing.T) {
 				if test.prepareDataPlugin != nil {
 					config = config.WithPrepareDataPlugins(test.prepareDataPlugin)
 				}
+				if test.preRequestPlugin != nil {
+					config = config.WithPreRequestPlugins(test.preRequestPlugin)
+				}
 				config = config.WithAdmissionPlugins(newMockAdmissionPlugin("test-admit-plugin", test.admitRequestDenialError))
 
-				locator := NewCachedPodLocator(context.Background(), NewDatastorePodLocator(ds), time.Minute)
-				director := NewDirectorWithConfig(ds, mockSched, test.mockAdmissionController, locator, config)
+				endpointCandidates := NewCachedEndpointCandidates(context.Background(), NewDatastoreEndpointCandidates(ds), time.Minute)
+				director := NewDirectorWithConfig(ds, mockSched, test.mockAdmissionController, endpointCandidates, config)
 				if test.name == "successful request with model rewrite" {
 					mockDs := &mockDatastore{
 						pods:     ds.PodList(datastore.AllPodsPredicate),
 						rewrites: []*v1alpha2.InferenceModelRewrite{rewrite},
 					}
 					director.datastore = mockDs
-					director.podLocator = NewCachedPodLocator(context.Background(), NewDatastorePodLocator(mockDs), time.Minute)
+					director.endpointCandidates = NewCachedEndpointCandidates(context.Background(), NewDatastoreEndpointCandidates(mockDs), time.Minute)
 				}
 
 				reqCtx := &handlers.RequestContext{
 					Request: &handlers.Request{
 						Headers: map[string]string{
-							requtil.RequestIdHeaderKey: "test-req-id-" + test.name, // Ensure a default request ID
+							reqcommon.RequestIdHeaderKey: "test-req-id-" + test.name, // Ensure a default request ID
 						},
 					},
 					ObjectiveKey:    test.inferenceObjectiveName,
@@ -685,12 +790,18 @@ func TestDirector_HandleRequest(t *testing.T) {
 					reqCtx.Request.Headers[":path"] = "/v1/chat/completions"
 				}
 
-				returnedReqCtx, err := director.HandleRequest(ctx, reqCtx)
+				inferenceRequestBody, parseErr := openai.NewOpenAIParser().ParseRequest(ctx, reqCtx.Request.RawBody, reqCtx.Request.Headers)
+				var returnedReqCtx *handlers.RequestContext
+				if parseErr != nil {
+					err = errcommon.Error{Code: errcommon.BadRequest, Msg: parseErr.Error()}
+				} else {
+					returnedReqCtx, err = director.HandleRequest(ctx, reqCtx, inferenceRequestBody)
+				}
 
 				if test.wantErrCode != "" {
 					assert.Error(t, err, "HandleRequest() should have returned an error")
-					var e errutil.Error
-					if assert.ErrorAs(t, err, &e, "Error should be of type errutil.Error") {
+					var e errcommon.Error
+					if assert.ErrorAs(t, err, &e, "Error should be of type errcommon.Error") {
 						assert.Equal(t, test.wantErrCode, e.Code, "Error code mismatch")
 					}
 					return
@@ -708,14 +819,15 @@ func TestDirector_HandleRequest(t *testing.T) {
 					assert.Equal(t, test.wantReqCtx.TargetEndpoint, returnedReqCtx.TargetEndpoint, "reqCtx.TargetEndpoint mismatch")
 				}
 
-				if test.wantMutatedBodyModel != "" {
+				if test.wantMutatedBody != nil {
 					assert.NotEmpty(t, returnedReqCtx.Request.RawBody, "Expected mutated body, but reqCtx.Request.Body is nil")
 					updatedBodyMap := make(map[string]any)
 					if err := json.Unmarshal(reqCtx.Request.RawBody, &updatedBodyMap); err != nil {
 						t.Errorf("Error to Unmarshal reqCtx.Request.UpdatedBody, err is %v", err)
 					}
-					assert.Equal(t, test.wantMutatedBodyModel, updatedBodyMap["model"],
-						"Mutated reqCtx.Request.Body model mismatch")
+					if diff := cmp.Diff(test.wantMutatedBody, updatedBodyMap); diff != "" {
+						t.Errorf("reqCtx.Request.RawBody mismatch (-want +got):\n%s", diff)
+					}
 				}
 				assert.Equal(t, len(reqCtx.Request.RawBody), reqCtx.RequestSize)
 			})
@@ -771,7 +883,7 @@ func TestGetRandomEndpoint(t *testing.T) {
 		period := time.Millisecond
 		factories := []datalayer.EndpointFactory{
 			backendmetrics.NewPodMetricsFactory(&backendmetrics.FakePodMetricsClient{}, period),
-			datalayer.NewEndpointFactory([]fwkdl.DataSource{&datalayer.FakeDataSource{}}, period),
+			datalayer.NewTestRuntime(t, period),
 		}
 		for _, epf := range factories {
 			t.Run(test.name, func(t *testing.T) {
@@ -782,7 +894,7 @@ func TestGetRandomEndpoint(t *testing.T) {
 					t.Errorf("unexpected error setting pool: %s", err)
 				}
 				for _, pod := range test.storePods {
-					ds.PodUpdateOrAddIfNotExist(pod)
+					ds.PodUpdateOrAddIfNotExist(context.Background(), pod)
 				}
 				d := &Director{datastore: ds}
 				gotEndpoint := d.GetRandomEndpoint()
@@ -964,8 +1076,8 @@ func TestDirector_ApplyWeightedModelRewrite(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			mockDs := &mockDatastore{rewrites: test.rewrites}
-			locator := NewCachedPodLocator(context.Background(), NewDatastorePodLocator(mockDs), time.Minute)
-			director := NewDirectorWithConfig(mockDs, &mockScheduler{}, &mockAdmissionController{}, locator, NewConfig())
+			endpointCandidates := NewCachedEndpointCandidates(context.Background(), NewDatastoreEndpointCandidates(mockDs), time.Minute)
+			director := NewDirectorWithConfig(mockDs, &mockScheduler{}, &mockAdmissionController{}, endpointCandidates, NewConfig())
 
 			reqCtx := &handlers.RequestContext{
 				IncomingModelName: test.incomingModel,
@@ -1065,19 +1177,19 @@ func TestDirector_HandleResponseReceived(t *testing.T) {
 	ctx := logutil.NewTestLoggerIntoContext(context.Background())
 	ds := datastore.NewDatastore(t.Context(), nil, 0)
 	mockSched := &mockScheduler{}
-	locator := NewCachedPodLocator(context.Background(), NewDatastorePodLocator(ds), time.Minute)
+	endpointCandidates := NewCachedEndpointCandidates(context.Background(), NewDatastoreEndpointCandidates(ds), time.Minute)
 	director := NewDirectorWithConfig(
 		ds,
 		mockSched,
 		&mockAdmissionController{},
-		locator,
+		endpointCandidates,
 		NewConfig().WithResponseReceivedPlugins(pr1),
 	)
 
 	reqCtx := &handlers.RequestContext{
 		Request: &handlers.Request{
 			Headers: map[string]string{
-				requtil.RequestIdHeaderKey: "test-req-id-for-response",
+				reqcommon.RequestIdHeaderKey: "test-req-id-for-response",
 			},
 		},
 		Response: &handlers.Response{ // Simulate some response headers
@@ -1087,10 +1199,7 @@ func TestDirector_HandleResponseReceived(t *testing.T) {
 		TargetPod: &fwkdl.EndpointMetadata{NamespacedName: types.NamespacedName{Namespace: "namespace1", Name: "test-pod-name"}},
 	}
 
-	_, err := director.HandleResponseReceived(ctx, reqCtx)
-	if err != nil {
-		t.Fatalf("HandleResponse() returned unexpected error: %v", err)
-	}
+	director.HandleResponseHeader(ctx, reqCtx)
 
 	if diff := cmp.Diff("test-req-id-for-response", pr1.lastRespOnResponse.RequestId); diff != "" {
 		t.Errorf("Scheduler.OnResponse RequestId mismatch (-want +got):\n%s", diff)
@@ -1103,19 +1212,19 @@ func TestDirector_HandleResponseReceived(t *testing.T) {
 	}
 }
 
-func TestDirector_HandleResponseStreaming(t *testing.T) {
+func TestDirector_HandleResponseBody(t *testing.T) {
 	ps1 := newTestResponseStreaming("ps1")
 
 	ctx := logutil.NewTestLoggerIntoContext(context.Background())
 	ds := datastore.NewDatastore(t.Context(), nil, 0)
 	mockSched := &mockScheduler{}
-	locator := NewCachedPodLocator(context.Background(), NewDatastorePodLocator(ds), time.Minute)
-	director := NewDirectorWithConfig(ds, mockSched, nil, locator, NewConfig().WithResponseStreamingPlugins(ps1))
+	endpointCandidates := NewCachedEndpointCandidates(context.Background(), NewDatastoreEndpointCandidates(ds), time.Minute)
+	director := NewDirectorWithConfig(ds, mockSched, nil, endpointCandidates, NewConfig().WithResponseStreamingPlugins(ps1))
 
 	reqCtx := &handlers.RequestContext{
 		Request: &handlers.Request{
 			Headers: map[string]string{
-				requtil.RequestIdHeaderKey: "test-req-id-for-streaming",
+				reqcommon.RequestIdHeaderKey: "test-req-id-for-streaming",
 			},
 		},
 		Response: &handlers.Response{
@@ -1124,57 +1233,116 @@ func TestDirector_HandleResponseStreaming(t *testing.T) {
 		TargetPod: &fwkdl.EndpointMetadata{NamespacedName: types.NamespacedName{Namespace: "namespace1", Name: "test-pod-name"}},
 	}
 
-	_, err := director.HandleResponseBodyStreaming(ctx, reqCtx)
-	if err != nil {
-		t.Fatalf("HandleResponseBodyStreaming() returned unexpected error: %v", err)
-	}
+	director.HandleResponseBody(ctx, reqCtx, false)
+	director.HandleResponseBody(ctx, reqCtx, false)
 
-	if diff := cmp.Diff("test-req-id-for-streaming", ps1.lastRespOnStreaming.RequestId); diff != "" {
-		t.Errorf("Scheduler.OnStreaming RequestId mismatch (-want +got):\n%s", diff)
-	}
-	if diff := cmp.Diff(reqCtx.Response.Headers, ps1.lastRespOnStreaming.Headers); diff != "" {
-		t.Errorf("Scheduler.OnStreaming Headers mismatch (-want +got):\n%s", diff)
-	}
-	if diff := cmp.Diff("namespace1/test-pod-name", ps1.lastTargetPodOnStreaming); diff != "" {
-		t.Errorf("Scheduler.OnStreaming TargetPodName mismatch (-want +got):\n%s", diff)
+	// Intermediate chunks (endOfStream=false) run asynchronously, wait for them.
+	require.Eventually(t, func() bool {
+		ps1.mu.Lock()
+		defer ps1.mu.Unlock()
+		return len(ps1.respsOnStreaming) >= 2
+	}, time.Second, 10*time.Millisecond, "async response body plugins should have been called for intermediate chunks")
+
+	// Final chunk (endOfStream=true) runs synchronously (drains queue first).
+	director.HandleResponseBody(ctx, reqCtx, true)
+
+	ps1.mu.Lock()
+	resps := make([]*fwk.Response, len(ps1.respsOnStreaming))
+	copy(resps, ps1.respsOnStreaming)
+	targetPods := make([]string, len(ps1.targetPodsOnStreaming))
+	copy(targetPods, ps1.targetPodsOnStreaming)
+	ps1.mu.Unlock()
+
+	assert.Equal(t, 3, len(resps), "Should have received 3 streaming calls")
+
+	for i, resp := range resps {
+		assert.Equal(t, "test-req-id-for-streaming", resp.RequestId)
+		assert.Equal(t, reqCtx.Response.Headers, resp.Headers)
+		assert.Equal(t, "namespace1/test-pod-name", targetPods[i])
+		if i < 2 {
+			assert.False(t, resp.EndOfStream, "EndOfStream should be false for chunk %d", i)
+		} else {
+			assert.True(t, resp.EndOfStream, "EndOfStream should be true for last chunk")
+		}
 	}
 }
 
-func TestDirector_HandleResponseComplete(t *testing.T) {
-	pc1 := newTestResponseComplete("pc1")
+func TestDirector_HandleResponseBody_ChunkOrdering(t *testing.T) {
+	// orderTrackingPlugin records the RequestId of each chunk it processes.
+	// Since we set a unique RequestId per chunk, the recorded order lets us
+	// verify that chunks are processed in the exact order they were sent,
+	// even though they go through the async queue.
+	plugin := &orderTrackingPlugin{
+		typedName: fwkplugin.TypedName{Type: "order-tracker", Name: "order-tracker"},
+	}
 
 	ctx := logutil.NewTestLoggerIntoContext(context.Background())
 	ds := datastore.NewDatastore(t.Context(), nil, 0)
-	mockSched := &mockScheduler{}
-	locator := NewCachedPodLocator(context.Background(), NewDatastorePodLocator(ds), time.Minute)
-	director := NewDirectorWithConfig(ds, mockSched, nil, locator, NewConfig().WithResponseCompletePlugins(pc1))
+	director := NewDirectorWithConfig(ds, &mockScheduler{}, nil, nil, NewConfig().WithResponseStreamingPlugins(plugin))
 
-	reqCtx := &handlers.RequestContext{
+	const numChunks = 50
+
+	for i := range numChunks {
+		reqCtx := &handlers.RequestContext{
+			Request: &handlers.Request{
+				Headers: map[string]string{
+					// All chunks share the same request ID so they go through the same queue.
+					reqcommon.RequestIdHeaderKey: "ordering-test-request",
+				},
+			},
+			Response: &handlers.Response{
+				Headers: map[string]string{},
+			},
+			TargetPod: &fwkdl.EndpointMetadata{},
+			Usage:     fwkrh.Usage{CompletionTokens: i},
+		}
+		director.HandleResponseBody(ctx, reqCtx, false)
+	}
+
+	// Send final chunk to drain the queue.
+	finalReqCtx := &handlers.RequestContext{
 		Request: &handlers.Request{
 			Headers: map[string]string{
-				requtil.RequestIdHeaderKey: "test-req-id-for-complete",
+				reqcommon.RequestIdHeaderKey: "ordering-test-request",
 			},
 		},
 		Response: &handlers.Response{
-			Headers: map[string]string{"X-Test-Complete-Header": "CompleteValue"},
+			Headers: map[string]string{},
 		},
-		TargetPod: &fwkdl.EndpointMetadata{NamespacedName: types.NamespacedName{Namespace: "namespace1", Name: "test-pod-name"}},
+		TargetPod: &fwkdl.EndpointMetadata{},
+		Usage:     fwkrh.Usage{CompletionTokens: numChunks},
 	}
+	director.HandleResponseBody(ctx, finalReqCtx, true)
 
-	_, err := director.HandleResponseBodyComplete(ctx, reqCtx)
-	if err != nil {
-		t.Fatalf("HandleResponseBodyComplete() returned unexpected error: %v", err)
-	}
+	// Total calls: numChunks async + 1 sync final.
+	plugin.mu.Lock()
+	tokenCounts := make([]int, len(plugin.observedTokenCounts))
+	copy(tokenCounts, plugin.observedTokenCounts)
+	plugin.mu.Unlock()
 
-	if diff := cmp.Diff("test-req-id-for-complete", pc1.lastRespOnComplete.RequestId); diff != "" {
-		t.Errorf("Scheduler.OnComplete RequestId mismatch (-want +got):\n%s", diff)
+	require.Equal(t, numChunks+1, len(tokenCounts), "should have received all chunk calls")
+
+	// Verify ordering: each chunk's CompletionTokens should appear in the order 0, 1, 2, ..., numChunks.
+	for i, tokens := range tokenCounts {
+		assert.Equal(t, i, tokens, "chunk %d was processed out of order", i)
 	}
-	if diff := cmp.Diff(reqCtx.Response.Headers, pc1.lastRespOnComplete.Headers); diff != "" {
-		t.Errorf("Scheduler.OnComplete Headers mismatch (-want +got):\n%s", diff)
-	}
-	if diff := cmp.Diff("namespace1/test-pod-name", pc1.lastTargetPodOnComplete); diff != "" {
-		t.Errorf("Scheduler.OnComplete TargetPodName mismatch (-want +got):\n%s", diff)
-	}
+}
+
+// orderTrackingPlugin records the CompletionTokens from each ResponseBody call to verify ordering.
+type orderTrackingPlugin struct {
+	mu                  sync.Mutex
+	typedName           fwkplugin.TypedName
+	observedTokenCounts []int
+}
+
+func (p *orderTrackingPlugin) TypedName() fwkplugin.TypedName {
+	return p.typedName
+}
+
+func (p *orderTrackingPlugin) ResponseBody(_ context.Context, _ *fwksched.InferenceRequest, response *fwk.Response, _ *fwkdl.EndpointMetadata) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.observedTokenCounts = append(p.observedTokenCounts, response.Usage.CompletionTokens)
 }
 
 const (
@@ -1184,21 +1352,21 @@ const (
 )
 
 type testResponseReceived struct {
+	mu                      sync.Mutex
 	typedName               fwkplugin.TypedName
 	lastRespOnResponse      *fwk.Response
 	lastTargetPodOnResponse string
 }
 
 type testResponseStreaming struct {
-	typedName                fwkplugin.TypedName
+	mu                    sync.Mutex
+	typedName             fwkplugin.TypedName
+	respsOnStreaming      []*fwk.Response
+	targetPodsOnStreaming []string
+
+	// Legacy fields for existing tests if any, but better to update them
 	lastRespOnStreaming      *fwk.Response
 	lastTargetPodOnStreaming string
-}
-
-type testResponseComplete struct {
-	typedName               fwkplugin.TypedName
-	lastRespOnComplete      *fwk.Response
-	lastTargetPodOnComplete string
 }
 
 func newTestResponseReceived(name string) *testResponseReceived {
@@ -1213,12 +1381,6 @@ func newTestResponseStreaming(name string) *testResponseStreaming {
 	}
 }
 
-func newTestResponseComplete(name string) *testResponseComplete {
-	return &testResponseComplete{
-		typedName: fwkplugin.TypedName{Type: testPostCompleteType, Name: name},
-	}
-}
-
 func (p *testResponseReceived) TypedName() fwkplugin.TypedName {
 	return p.typedName
 }
@@ -1227,21 +1389,20 @@ func (p *testResponseStreaming) TypedName() fwkplugin.TypedName {
 	return p.typedName
 }
 
-func (p *testResponseComplete) TypedName() fwkplugin.TypedName {
-	return p.typedName
-}
-
-func (p *testResponseReceived) ResponseReceived(_ context.Context, _ *fwksched.LLMRequest, response *fwk.Response, targetPod *fwkdl.EndpointMetadata) {
+func (p *testResponseReceived) ResponseHeader(_ context.Context, _ *fwksched.InferenceRequest, response *fwk.Response, targetPod *fwkdl.EndpointMetadata) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.lastRespOnResponse = response
 	p.lastTargetPodOnResponse = targetPod.NamespacedName.String()
 }
 
-func (p *testResponseStreaming) ResponseStreaming(_ context.Context, _ *fwksched.LLMRequest, response *fwk.Response, targetPod *fwkdl.EndpointMetadata) {
+func (p *testResponseStreaming) ResponseBody(_ context.Context, _ *fwksched.InferenceRequest, response *fwk.Response, targetPod *fwkdl.EndpointMetadata) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.respsOnStreaming = append(p.respsOnStreaming, response)
+	p.targetPodsOnStreaming = append(p.targetPodsOnStreaming, targetPod.NamespacedName.String())
+
+	// Maintain legacy fields for compatibility
 	p.lastRespOnStreaming = response
 	p.lastTargetPodOnStreaming = targetPod.NamespacedName.String()
-}
-
-func (p *testResponseComplete) ResponseComplete(_ context.Context, _ *fwksched.LLMRequest, response *fwk.Response, targetPod *fwkdl.EndpointMetadata) {
-	p.lastRespOnComplete = response
-	p.lastTargetPodOnComplete = targetPod.NamespacedName.String()
 }

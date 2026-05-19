@@ -35,7 +35,7 @@ cd gateway-api-inference-extension/benchmarking/single-workload
   # Get gateway IP
   GW_IP=$(kubectl get gateway/inference-gateway -o jsonpath='{.status.addresses[0].value}')
   # Get LoadBalancer k8s service IP
-  SVC_IP=$(kubectl get service/vllm-llama3-8b-instruct -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+  SVC_IP=$(kubectl get service/vllm-qwen3-32b -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
 
   echo $GW_IP
   echo $SVC_IP
@@ -123,3 +123,18 @@ helm uninstall decode-heavy
 
 ## Post Benchmark Analysis
 Follow the benchmarking guide instructions to [compare benchmark results](https://gateway-api-inference-extension.sigs.k8s.io/performance/benchmark/#analyze-the-results).
+
+
+## Running E2E Tests
+
+The following E2E test runs on GitHub using GitHub Actions.
+
+> If you have `MAINTAINER` access or above, you can trigger the workflow run from the GitHub Actions page, or by leaving a comment on the PR. 
+
+> Please make sure there is no other GKE tests of the same type running at the same time, as they can interfere with each other.
+
+
+| Test name	| Link | PR comment trigger
+| :--- | :--- | :--- |
+| GKE Decode Heavy Test | https://github.com/gateway-api-inference-extension/.github/workflows/e2e-decode-heavy-gke.yaml | /run-gke-decode-heavy |
+| GKE Decode Heavy Test with Standalone EPP	| https://github.com/gateway-api-inference-extension/.github/workflows/e2e-decode-heavy-gke-standlone-epp.yaml | /run-gke-decode-heavy-standalone-epp |

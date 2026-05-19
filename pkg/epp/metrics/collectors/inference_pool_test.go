@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/datalayer"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/datastore"
 	fwkdl "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/datalayer"
+	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/plugins/datalayer/source/mocks"
 	poolutil "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/util/pool"
 )
 
@@ -55,7 +56,7 @@ func TestNoMetricsCollected(t *testing.T) {
 	period := time.Second
 	factories := []datalayer.EndpointFactory{
 		backendmetrics.NewPodMetricsFactory(&backendmetrics.FakePodMetricsClient{}, period),
-		datalayer.NewEndpointFactory([]fwkdl.DataSource{&datalayer.FakeDataSource{}}, period),
+		datalayer.NewTestRuntime(t, period),
 	}
 	for _, epf := range factories {
 		ds := datastore.NewDatastore(context.Background(), epf, 0)
@@ -75,9 +76,15 @@ func TestMetricsCollected(t *testing.T) {
 		pod1NamespacedName: pod1Metrics,
 	}
 	period := time.Millisecond
+	mockDS := &mocks.MetricsDataSource{}
+	mockDS.SetMetrics(metrics)
 	factories := []datalayer.EndpointFactory{
 		backendmetrics.NewPodMetricsFactory(&backendmetrics.FakePodMetricsClient{Res: metrics}, period),
-		datalayer.NewEndpointFactory([]fwkdl.DataSource{&datalayer.FakeDataSource{Metrics: metrics}}, period),
+		datalayer.NewTestRuntimeWithConfig(t, period, &datalayer.Config{
+			Sources: []datalayer.DataSourceConfig{
+				{Plugin: mockDS},
+			},
+		}),
 	}
 	for _, epf := range factories {
 		inferencePool := &v1.InferencePool{
@@ -96,7 +103,7 @@ func TestMetricsCollected(t *testing.T) {
 			Build()
 
 		_ = ds.PoolSet(context.Background(), fakeClient, poolutil.InferencePoolToEndpointPool(inferencePool))
-		_ = ds.PodUpdateOrAddIfNotExist(pod1)
+		_ = ds.PodUpdateOrAddIfNotExist(context.Background(), pod1)
 
 		time.Sleep(1 * time.Second)
 

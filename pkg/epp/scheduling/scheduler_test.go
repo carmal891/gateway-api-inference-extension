@@ -30,18 +30,21 @@ import (
 	fwkdl "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/datalayer"
 	fwksched "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/scheduling"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/plugins/scheduling/picker"
+	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/plugins/scheduling/picker/maxscore"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/plugins/scheduling/profile"
-	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/plugins/scheduling/scorer"
-	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/plugins/scheduling/scorer/prefix"
+	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/plugins/scheduling/scorer/kvcacheutilization"
+	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/plugins/scheduling/scorer/loraaffinity"
+	schedprefix "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/plugins/scheduling/scorer/prefix"
+	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/plugins/scheduling/scorer/queuedepth"
 )
 
 // Tests the default scheduler configuration and expected behavior.
 func TestSchedule(t *testing.T) {
-	kvCacheUtilizationScorer := scorer.NewKVCacheUtilizationScorer()
-	queueingScorer := scorer.NewQueueScorer()
-	prefixCacheScorer, err := prefix.New(context.Background(), prefix.DefaultConfig)
+	kvCacheUtilizationScorer := kvcacheutilization.NewKVCacheUtilizationScorer()
+	queueingScorer := queuedepth.NewQueueScorer()
+	prefixCacheScorer, err := schedprefix.New(context.Background())
 	assert.NoError(t, err)
-	loraAffinityScorer := scorer.NewLoraAffinityScorer()
+	loraAffinityScorer := loraaffinity.NewLoraAffinityScorer()
 
 	defaultProfile := NewSchedulerProfile().
 		WithScorers(NewWeightedScorer(kvCacheUtilizationScorer, 1),
@@ -49,7 +52,7 @@ func TestSchedule(t *testing.T) {
 			NewWeightedScorer(prefixCacheScorer, 1),
 			NewWeightedScorer(loraAffinityScorer, 1),
 		).
-		WithPicker(picker.NewMaxScorePicker(picker.DefaultMaxNumOfEndpoints))
+		WithPicker(maxscore.NewMaxScorePicker(picker.DefaultMaxNumOfEndpoints))
 
 	profileHandler := profile.NewSingleProfileHandler()
 
@@ -57,14 +60,14 @@ func TestSchedule(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		req     *fwksched.LLMRequest
+		req     *fwksched.InferenceRequest
 		input   []fwksched.Endpoint
 		wantRes *fwksched.SchedulingResult
 		err     bool
 	}{
 		{
 			name: "no candidate endpoints",
-			req: &fwksched.LLMRequest{
+			req: &fwksched.InferenceRequest{
 				RequestId:   uuid.NewString(),
 				TargetModel: "any-model",
 			},
@@ -74,7 +77,7 @@ func TestSchedule(t *testing.T) {
 		},
 		{
 			name: "finds optimal endpoint",
-			req: &fwksched.LLMRequest{
+			req: &fwksched.InferenceRequest{
 				RequestId:   uuid.NewString(),
 				TargetModel: "critical",
 			},

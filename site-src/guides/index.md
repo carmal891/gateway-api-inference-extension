@@ -8,6 +8,10 @@
 
 --8<-- "site-src/_includes/prereqs.md"
 
+### Verify Prerequisites
+
+--8<-- "site-src/_includes/verify-prereqs.md"
+
 ## **Steps**
 
 ### Set Latest Release Variable
@@ -24,19 +28,25 @@ IGW_LATEST_RELEASE=$(curl -s https://api.github.com/repos/kubernetes-sigs/gatewa
 --8<-- "site-src/_includes/vllm-gpu.md"
 
     ```bash
-    kubectl create secret generic hf-token --from-literal=token=$HF_TOKEN # Your Hugging Face Token with access to the set of Llama models
+    export INFERENCE_POOL_NAME=vllm-qwen3-32b
+    export MODEL_NAME=Qwen/Qwen3-32B
+    kubectl create secret generic hf-token --from-literal=token=$HF_TOKEN # Your Hugging Face Token with access to the set of Qwen models
     kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/gateway-api-inference-extension/refs/tags/${IGW_LATEST_RELEASE}/config/manifests/vllm/gpu-deployment.yaml
     ```
 
 --8<-- "site-src/_includes/model-server-cpu.md"
 
     ```bash
+    export INFERENCE_POOL_NAME=vllm-qwen3-32b
+    export MODEL_NAME=Qwen/Qwen3-32B
     kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/gateway-api-inference-extension/refs/tags/${IGW_LATEST_RELEASE}/config/manifests/vllm/cpu-deployment.yaml
     ```
 
 --8<-- "site-src/_includes/model-server-sim.md"
 
     ```bash
+    export INFERENCE_POOL_NAME=vllm-qwen3-32b
+    export MODEL_NAME=Qwen/Qwen3-32B
     kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/gateway-api-inference-extension/refs/tags/${IGW_LATEST_RELEASE}/config/manifests/vllm/sim-deployment.yaml
     ```
 
@@ -46,13 +56,21 @@ IGW_LATEST_RELEASE=$(curl -s https://api.github.com/repos/kubernetes-sigs/gatewa
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/download/${IGW_LATEST_RELEASE}/manifests.yaml
 ```
 
+Verify the CRDs were installed successfully:
+
+```bash
+kubectl get crds | grep inference.networking.k8s.io
+```
+
+You should see output listing the inference-related CRDs.
+
 ### Install the Gateway
 
    Choose one of the following options to install Gateway.
 
 === "GKE"
 
-      Nothing to install here, you can move to the next [section](#deploy-the-inferencepool-and-endpoint-picker-extension)
+      GKE comes with Gateway API support built-in, so you can skip this step and move to the next [section](#deploy-an-inference-gateway).
 
 === "Istio"
 
@@ -81,38 +99,36 @@ kubectl apply -f https://github.com/kubernetes-sigs/gateway-api-inference-extens
          >
          > Istio v1.28.0 includes full support for InferencePool v1. This guide assumes you are using Istio v1.28.0 or later to ensure compatibility with the InferencePool API.
 
-=== "Kgateway"
+=== "Agentgateway"
 
       1. Requirements
 
          - Gateway API [CRDs](https://gateway-api.sigs.k8s.io/guides/#installing-gateway-api) installed.
 
-      1. Set the Kgateway version and install the Kgateway CRDs:
+      1. Set the Agentgateway version and install the Agentgateway CRDs:
 
          ```bash
-         KGTW_VERSION=v2.2.0-main
-         helm upgrade -i --create-namespace --namespace kgateway-system --version $KGTW_VERSION kgateway-crds oci://cr.kgateway.dev/kgateway-dev/charts/kgateway-crds
+         AGW_VERSION=v1.0.0
+         helm upgrade -i --create-namespace --namespace agentgateway-system --version $AGW_VERSION agentgateway-crds oci://cr.agentgateway.dev/charts/agentgateway-crds
          ```
 
-      1. Install Kgateway:
+      1. Install Agentgateway:
 
          ```bash
-         helm upgrade -i --namespace kgateway-system --version $KGTW_VERSION kgateway oci://cr.kgateway.dev/kgateway-dev/charts/kgateway --set inferenceExtension.enabled=true
+         helm upgrade -i --namespace agentgateway-system --version $AGW_VERSION agentgateway oci://cr.agentgateway.dev/charts/agentgateway --set inferenceExtension.enabled=true
          ```
 
 === "NGINX Gateway Fabric"
 
       1. Requirements
 
-         - Gateway API [CRDs](https://gateway-api.sigs.k8s.io/guides/#installing-gateway-api) installed (Standard or Experimental channel).
-         - A Kubernetes cluster with LoadBalancer or NodePort access.
+         - Gateway API [CRDs](https://gateway-api.sigs.k8s.io/guides/#installing-gateway-api) installed.
 
       1. Install NGINX Gateway Fabric with the Inference Extension enabled by setting the `nginxGateway.gwAPIInferenceExtension.enable=true` Helm value
 
-         ```bash 
+         ```bash
          helm install ngf oci://ghcr.io/nginx/charts/nginx-gateway-fabric --create-namespace -n nginx-gateway --set nginxGateway.gwAPIInferenceExtension.enable=true
          ```
-         This enables NGINX Gateway Fabric to watch and manage Inference Extension resources such as InferencePool and InferenceObjective.
 
 ### Deploy an Inference Gateway
 
@@ -157,17 +173,26 @@ kubectl apply -f https://github.com/kubernetes-sigs/gateway-api-inference-extens
          inference-gateway   inference-gateway   <MY_ADDRESS>    True         22s
          ```
 
-=== "Kgateway"
+=== "Agentgateway"
 
-      [Kgateway](https://kgateway.dev/) is a Gateway API and Inference Gateway
-      [conformant](https://github.com/kubernetes-sigs/gateway-api-inference-extension/tree/main/conformance/reports/v1.0.0/gateway/kgateway)
-      implementation. Kgateway supports Inference Gateway with the [agentgateway](https://agentgateway.dev/) data plane. Follow these steps
-      to run Kgateway as an Inference Gateway:
+      [Agentgateway](https://agentgateway.dev/) is a Gateway API and Inference Gateway implementation. Follow these steps
+      to run Agentgateway as an Inference Gateway:
 
       1. Deploy the Inference Gateway:
 
          ```bash
-         kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/gateway-api-inference-extension/refs/tags/${IGW_LATEST_RELEASE}/config/manifests/gateway/kgateway/gateway.yaml
+         cat <<'EOF' | kubectl apply -f -
+         apiVersion: gateway.networking.k8s.io/v1
+         kind: Gateway
+         metadata:
+           name: inference-gateway
+         spec:
+           gatewayClassName: agentgateway
+           listeners:
+           - name: http
+             port: 80
+             protocol: HTTP
+         EOF
          ```
 
       1. Confirm that the Gateway was assigned an IP address and reports a `Programmed=True` status:
@@ -179,8 +204,6 @@ kubectl apply -f https://github.com/kubernetes-sigs/gateway-api-inference-extens
          ```
 
 === "NGINX Gateway Fabric"
-
-      NGINX Gateway Fabric is an implementation of the Gateway API that supports the Inference Extension. Follow these steps to deploy an Inference Gateway using NGINX Gateway Fabric.
 
       1. Deploy the Gateway
 
@@ -196,11 +219,11 @@ kubectl apply -f https://github.com/kubernetes-sigs/gateway-api-inference-extens
          inference-gateway   inference-gateway   <MY_ADDRESS>    True         22s
          ```
       
-       For more information, see the [NGINX Gateway Fabric - Inference Gateway Setup guide](https://docs.nginx.com/nginx-gateway-fabric/how-to/gateway-api-inference-extension/#overview)
+       For more information, see the [NGINX Gateway Fabric - Inference Gateway Setup guide](https://docs.nginx.com/nginx-gateway-fabric/how-to/gateway-api-inference-extension/)
 
 ### Deploy the InferencePool and Endpoint Picker Extension
 
-   Install an InferencePool named `vllm-llama3-8b-instruct` that selects from endpoints with label `app: vllm-llama3-8b-instruct` and listening on port 8000. The Helm install command automatically installs the EPP, InferencePool along with provider specific resources.
+   Install an InferencePool that selects the endpoints from the sample model server you deployed and listens on port 8000. The Helm install command automatically installs the EPP, InferencePool along with provider specific resources.
 
    Set the chart version and then select a tab to follow the provider-specific instructions.
 
@@ -240,7 +263,7 @@ You have now deployed a basic Inference Gateway with a simple routing strategy. 
    1. Uninstall the InferencePool, InferenceObjective and model server resources:
 
       ```bash
-      helm uninstall vllm-qwen3-32b 
+      helm uninstall ${INFERENCE_POOL_NAME}
       kubectl delete -f https://raw.githubusercontent.com/kubernetes-sigs/gateway-api-inference-extension/refs/tags/${IGW_LATEST_RELEASE}/config/manifests/inferenceobjective.yaml --ignore-not-found
       kubectl delete -f https://raw.githubusercontent.com/kubernetes-sigs/gateway-api-inference-extension/refs/tags/${IGW_LATEST_RELEASE}/config/manifests/vllm/cpu-deployment.yaml --ignore-not-found
       kubectl delete -f https://raw.githubusercontent.com/kubernetes-sigs/gateway-api-inference-extension/refs/tags/${IGW_LATEST_RELEASE}/config/manifests/vllm/gpu-deployment.yaml --ignore-not-found
@@ -284,30 +307,30 @@ You have now deployed a basic Inference Gateway with a simple routing strategy. 
          kubectl delete ns istio-system
          ```
 
-=== "Kgateway"
+=== "Agentgateway"
 
       ```bash
-      kubectl delete -f https://raw.githubusercontent.com/kubernetes-sigs/gateway-api-inference-extension/refs/tags/${IGW_LATEST_RELEASE}/config/manifests/gateway/kgateway/gateway.yaml --ignore-not-found
+      kubectl delete gateway inference-gateway --ignore-not-found
       ```
 
-      The following steps assume you would like to cleanup ALL Kgateway resources that were created in this quickstart guide.
+      The following steps assume you would like to cleanup ALL Agentgateway resources that were created in this quickstart guide.
 
-      1. Uninstall Kgateway:
+      1. Uninstall Agentgateway:
 
          ```bash
-         helm uninstall kgateway -n kgateway-system
+         helm uninstall agentgateway -n agentgateway-system
          ```
 
-      1. Uninstall the Kgateway CRDs:
+      1. Uninstall the Agentgateway CRDs:
 
          ```bash
-         helm uninstall kgateway-crds -n kgateway-system
+         helm uninstall agentgateway-crds -n agentgateway-system
          ```
 
-      1. Remove the Kgateway namespace:
+      1. Remove the Agentgateway namespace:
 
          ```bash
-         kubectl delete ns kgateway-system
+         kubectl delete ns agentgateway-system
          ```
 
 === "NGINX Gateway Fabric"

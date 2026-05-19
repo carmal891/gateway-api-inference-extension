@@ -22,12 +22,15 @@ import (
 
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/flowcontrol"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/plugin"
+	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/scheduling"
 )
 
 // MockFlowControlRequest provides a mock implementation of the FlowControlRequest interface.
 type MockFlowControlRequest struct {
 	FlowKeyV             flowcontrol.FlowKey
 	ByteSizeV            uint64
+	InferenceRequestV    *scheduling.InferenceRequest
+	ReceivedTimestampV   time.Time
 	InitialEffectiveTTLV time.Duration
 	IDV                  string
 	MetadataV            map[string]any
@@ -38,27 +41,6 @@ type MockFlowControlRequest struct {
 
 // MockRequestOption is a functional option for configuring a MockFlowControlRequest.
 type MockRequestOption func(*MockFlowControlRequest)
-
-// WithInferencePoolName sets the InferencePoolName for the mock request.
-func WithInferencePoolName(name string) MockRequestOption {
-	return func(m *MockFlowControlRequest) {
-		m.InferencePoolNameV = name
-	}
-}
-
-// WithModelName sets the ModelName for the mock request.
-func WithModelName(name string) MockRequestOption {
-	return func(m *MockFlowControlRequest) {
-		m.ModelNameV = name
-	}
-}
-
-// WithTargetModelName sets the TargetModelName for the mock request.
-func WithTargetModelName(name string) MockRequestOption {
-	return func(m *MockFlowControlRequest) {
-		m.TargetModelNameV = name
-	}
-}
 
 // NewMockFlowControlRequest creates a new MockFlowControlRequest instance with optional configuration.
 func NewMockFlowControlRequest(
@@ -81,8 +63,12 @@ func NewMockFlowControlRequest(
 	return m
 }
 
-func (m *MockFlowControlRequest) FlowKey() flowcontrol.FlowKey       { return m.FlowKeyV }
-func (m *MockFlowControlRequest) ByteSize() uint64                   { return m.ByteSizeV }
+func (m *MockFlowControlRequest) FlowKey() flowcontrol.FlowKey { return m.FlowKeyV }
+func (m *MockFlowControlRequest) ByteSize() uint64             { return m.ByteSizeV }
+func (m *MockFlowControlRequest) InferenceRequest() *scheduling.InferenceRequest {
+	return m.InferenceRequestV
+}
+func (m *MockFlowControlRequest) ReceivedTimestamp() time.Time       { return m.ReceivedTimestampV }
 func (m *MockFlowControlRequest) InitialEffectiveTTL() time.Duration { return m.InitialEffectiveTTLV }
 func (m *MockFlowControlRequest) ID() string                         { return m.IDV }
 func (m *MockFlowControlRequest) GetMetadata() map[string]any        { return m.MetadataV }
@@ -187,16 +173,14 @@ var _ flowcontrol.FlowQueueAccessor = &MockFlowQueueAccessor{}
 // This avoids collision with the interface method of the same name.
 type MockPriorityBandAccessor struct {
 	PriorityV         int
-	PriorityNameV     string
 	PolicyStateV      any
 	FlowKeysFunc      func() []flowcontrol.FlowKey
 	QueueFunc         func(flowID string) flowcontrol.FlowQueueAccessor
 	IterateQueuesFunc func(callback func(flow flowcontrol.FlowQueueAccessor) (keepIterating bool))
 }
 
-func (m *MockPriorityBandAccessor) Priority() int        { return m.PriorityV }
-func (m *MockPriorityBandAccessor) PriorityName() string { return m.PriorityNameV }
-func (m *MockPriorityBandAccessor) PolicyState() any     { return m.PolicyStateV }
+func (m *MockPriorityBandAccessor) Priority() int    { return m.PriorityV }
+func (m *MockPriorityBandAccessor) PolicyState() any { return m.PolicyStateV }
 
 func (m *MockPriorityBandAccessor) FlowKeys() []flowcontrol.FlowKey {
 	if m.FlowKeysFunc != nil {

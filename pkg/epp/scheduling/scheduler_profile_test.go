@@ -18,6 +18,7 @@ package scheduling
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -119,7 +120,7 @@ func TestSchedulePlugins(t *testing.T) {
 			test.profile.picker.(*testPlugin).reset()
 
 			// Initialize the scheduling context
-			request := &fwksched.LLMRequest{
+			request := &fwksched.InferenceRequest{
 				TargetModel: "test-model",
 				RequestId:   uuid.NewString(),
 			}
@@ -203,13 +204,13 @@ func (tp *testPlugin) Category() fwksched.ScorerCategory {
 	return fwksched.Distribution
 }
 
-func (tp *testPlugin) Filter(_ context.Context, _ *fwksched.CycleState, _ *fwksched.LLMRequest, endpoints []fwksched.Endpoint) []fwksched.Endpoint {
+func (tp *testPlugin) Filter(_ context.Context, _ *fwksched.CycleState, _ *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) []fwksched.Endpoint {
 	tp.FilterCallCount++
 	return findEndpoints(endpoints, tp.FilterRes...)
 
 }
 
-func (tp *testPlugin) Score(_ context.Context, _ *fwksched.CycleState, _ *fwksched.LLMRequest, endpoints []fwksched.Endpoint) map[fwksched.Endpoint]float64 {
+func (tp *testPlugin) Score(_ context.Context, _ *fwksched.CycleState, _ *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) map[fwksched.Endpoint]float64 {
 	tp.ScoreCallCount++
 	scoredEndpoints := make(map[fwksched.Endpoint]float64, len(endpoints))
 	for _, endpoint := range endpoints {
@@ -240,6 +241,366 @@ func (tp *testPlugin) reset() {
 	tp.NumOfScoredEndpoints = 0
 	tp.PickCallCount = 0
 	tp.NumOfPickerCandidates = 0
+}
+
+func TestAddPlugins(t *testing.T) {
+	tests := []struct {
+		name        string
+		plugins     []fwkplugin.Plugin
+		wantFilters int
+		wantScorers int
+		wantPicker  bool
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name: "add WeightedScorer that also implements Filter and Picker",
+			plugins: []fwkplugin.Plugin{
+				NewWeightedScorer(&testPlugin{TypeRes: "multi"}, 1.0),
+			},
+			wantFilters: 1,
+			wantScorers: 1,
+			wantPicker:  true,
+		},
+		{
+			name: "add plugin that only implements Filter",
+			plugins: []fwkplugin.Plugin{
+				&filterOnlyPlugin{typedName: fwkplugin.TypedName{Name: "filter-only"}},
+			},
+			wantFilters: 1,
+			wantScorers: 0,
+			wantPicker:  false,
+		},
+		{
+			name: "error when adding Scorer without weight",
+			plugins: []fwkplugin.Plugin{
+				&testPlugin{TypeRes: "bare-scorer"},
+			},
+			wantErr:     true,
+			errContains: "without a weight",
+		},
+		{
+			name: "error when adding duplicate picker",
+			plugins: []fwkplugin.Plugin{
+				NewWeightedScorer(&testPlugin{TypeRes: "picker1"}, 1.0),
+				NewWeightedScorer(&testPlugin{TypeRes: "picker2"}, 1.0),
+			},
+			wantErr:     true,
+			errContains: "already have a registered picker",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			profile := NewSchedulerProfile()
+			err := profile.AddPlugins(test.plugins...)
+
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("expected error but got nil")
+				}
+				if test.errContains != "" && !strings.Contains(err.Error(), test.errContains) {
+					t.Errorf("error %q does not contain %q", err.Error(), test.errContains)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(profile.filters) != test.wantFilters {
+				t.Errorf("got %d filters, want %d", len(profile.filters), test.wantFilters)
+			}
+			if len(profile.scorers) != test.wantScorers {
+				t.Errorf("got %d scorers, want %d", len(profile.scorers), test.wantScorers)
+			}
+			if test.wantPicker && profile.picker == nil {
+				t.Errorf("expected picker to be set")
+			}
+			if !test.wantPicker && profile.picker != nil {
+				t.Errorf("expected picker to be nil")
+			}
+		})
+	}
+}
+
+func TestSchedulerProfileString(t *testing.T) {
+	tp1 := &testPlugin{TypeRes: "test1"}
+	tp2 := &testPlugin{TypeRes: "test2"}
+	pickerPlugin := &testPlugin{TypeRes: "picker"}
+
+	profile := NewSchedulerProfile().
+		WithFilters(tp1, tp2).
+		WithScorers(NewWeightedScorer(tp1, 1.5), NewWeightedScorer(tp2, 2.0)).
+		WithPicker(pickerPlugin)
+
+	result := profile.String()
+
+	// Verify the string contains filter, scorer, and picker info
+	if !strings.Contains(result, "Filters:") {
+		t.Errorf("String() missing Filters section: %s", result)
+	}
+	if !strings.Contains(result, "Scorers:") {
+		t.Errorf("String() missing Scorers section: %s", result)
+	}
+	if !strings.Contains(result, "Picker:") {
+		t.Errorf("String() missing Picker section: %s", result)
+	}
+}
+
+func TestEnforceScoreRange(t *testing.T) {
+	tests := []struct {
+		name  string
+		score float64
+		want  float64
+	}{
+		{name: "negative score clamped to 0", score: -0.5, want: 0},
+		{name: "score above 1 clamped to 1", score: 1.5, want: 1},
+		{name: "score at 0 stays 0", score: 0, want: 0},
+		{name: "score at 1 stays 1", score: 1, want: 1},
+		{name: "score in range stays unchanged", score: 0.5, want: 0.5},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := enforceScoreRange(test.score)
+			if got != test.want {
+				t.Errorf("enforceScoreRange(%v) = %v, want %v", test.score, got, test.want)
+			}
+		})
+	}
+}
+
+func TestRunWithOutOfRangeScores(t *testing.T) {
+	// Scorer that returns negative score
+	negativeScorer := &testPlugin{
+		TypeRes:   "negative",
+		ScoreRes:  -0.5,
+		FilterRes: []k8stypes.NamespacedName{{Name: "pod1"}},
+	}
+	// Scorer that returns score > 1
+	overScorer := &testPlugin{
+		TypeRes:   "over",
+		ScoreRes:  1.5,
+		FilterRes: []k8stypes.NamespacedName{{Name: "pod1"}},
+	}
+	pickerPlugin := &testPlugin{
+		TypeRes: "picker",
+		PickRes: k8stypes.NamespacedName{Name: "pod1"},
+	}
+
+	profile := NewSchedulerProfile().
+		WithFilters().
+		WithScorers(NewWeightedScorer(negativeScorer, 1), NewWeightedScorer(overScorer, 1)).
+		WithPicker(pickerPlugin)
+
+	input := []fwksched.Endpoint{
+		fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod1"}}, nil, nil),
+	}
+
+	request := &fwksched.InferenceRequest{
+		TargetModel: "test-model",
+		RequestId:   uuid.NewString(),
+	}
+
+	_, err := profile.Run(context.Background(), request, fwksched.NewCycleState(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// negative score clamped to 0, over score clamped to 1: total = 0*1 + 1*1 = 1.0
+	if pickerPlugin.WinnerEndpointScore != 1.0 {
+		t.Errorf("expected winner score 1.0, got %v", pickerPlugin.WinnerEndpointScore)
+	}
+}
+
+// TestFilterExecutionOrder verifies that filters execute in the order they are
+// registered in the scheduling profile. See also TestFilterExecutionOrderFromYAML
+// in pkg/epp/config/loader which verifies that YAML declaration order is preserved
+// during deserialization.
+func TestFilterExecutionOrder(t *testing.T) {
+	executionOrder := []string{}
+
+	// Create three order-tracking filters.
+	filterA := &orderTrackingFilter{
+		name:           "filter-A",
+		executionOrder: &executionOrder,
+	}
+	filterB := &orderTrackingFilter{
+		name:           "filter-B",
+		executionOrder: &executionOrder,
+	}
+	filterC := &orderTrackingFilter{
+		name:           "filter-C",
+		executionOrder: &executionOrder,
+	}
+
+	pickerPlugin := &testPlugin{
+		TypeRes: "picker",
+		PickRes: k8stypes.NamespacedName{Name: "pod1"},
+	}
+
+	// Declare filters in order A, B, C.
+	profile := NewSchedulerProfile().
+		WithFilters(filterA, filterB, filterC).
+		WithPicker(pickerPlugin)
+
+	input := []fwksched.Endpoint{
+		fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod1"}}, nil, nil),
+		fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod2"}}, nil, nil),
+	}
+
+	request := &fwksched.InferenceRequest{
+		TargetModel: "test-model",
+		RequestId:   uuid.NewString(),
+	}
+
+	_, err := profile.Run(context.Background(), request, fwksched.NewCycleState(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify execution order matches declaration order.
+	wantOrder := []string{"filter-A", "filter-B", "filter-C"}
+	if diff := cmp.Diff(wantOrder, executionOrder); diff != "" {
+		t.Errorf("Filter execution order mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// TestFilterExecutionOrderViaAddPlugins verifies that filters added via
+// AddPlugins (the path used by the config loader) execute in registration order.
+func TestFilterExecutionOrderViaAddPlugins(t *testing.T) {
+	executionOrder := []string{}
+
+	filterA := &orderTrackingFilter{name: "filter-A", executionOrder: &executionOrder}
+	filterB := &orderTrackingFilter{name: "filter-B", executionOrder: &executionOrder}
+	filterC := &orderTrackingFilter{name: "filter-C", executionOrder: &executionOrder}
+
+	pickerPlugin := &testPlugin{
+		TypeRes: "picker",
+		PickRes: k8stypes.NamespacedName{Name: "pod1"},
+	}
+
+	// Use AddPlugins sequentially, as the config loader does.
+	profile := NewSchedulerProfile()
+	for _, p := range []fwkplugin.Plugin{filterA, filterB, filterC} {
+		if err := profile.AddPlugins(p); err != nil {
+			t.Fatalf("unexpected error adding plugin: %v", err)
+		}
+	}
+	profile.WithPicker(pickerPlugin)
+
+	input := []fwksched.Endpoint{
+		fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod1"}}, nil, nil),
+	}
+
+	request := &fwksched.InferenceRequest{
+		TargetModel: "test-model",
+		RequestId:   uuid.NewString(),
+	}
+
+	_, err := profile.Run(context.Background(), request, fwksched.NewCycleState(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	wantOrder := []string{"filter-A", "filter-B", "filter-C"}
+	if diff := cmp.Diff(wantOrder, executionOrder); diff != "" {
+		t.Errorf("Filter execution order mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// TestFilterChainReceivesPreviousOutput verifies that each filter in the chain
+// receives the filtered output of the previous filter, not the original input.
+// This confirms filters execute as a sequential pipeline.
+func TestFilterChainReceivesPreviousOutput(t *testing.T) {
+	// First filter keeps pod1 and pod2 (removes pod3).
+	filter1 := &testPlugin{
+		TypeRes:   "filter1",
+		FilterRes: []k8stypes.NamespacedName{{Name: "pod1"}, {Name: "pod2"}},
+	}
+	// Second filter keeps only pod1 (removes pod2).
+	filter2 := &testPlugin{
+		TypeRes:   "filter2",
+		FilterRes: []k8stypes.NamespacedName{{Name: "pod1"}},
+	}
+	// Third filter is a pass-through that records what it received.
+	receivedCount := 0
+	filter3 := &countingFilter{
+		name:          "filter3",
+		receivedCount: &receivedCount,
+	}
+
+	pickerPlugin := &testPlugin{
+		TypeRes: "picker",
+		PickRes: k8stypes.NamespacedName{Name: "pod1"},
+	}
+
+	profile := NewSchedulerProfile().
+		WithFilters(filter1, filter2, filter3).
+		WithPicker(pickerPlugin)
+
+	input := []fwksched.Endpoint{
+		fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod1"}}, nil, nil),
+		fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod2"}}, nil, nil),
+		fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod3"}}, nil, nil),
+	}
+
+	request := &fwksched.InferenceRequest{
+		TargetModel: "test-model",
+		RequestId:   uuid.NewString(),
+	}
+
+	_, err := profile.Run(context.Background(), request, fwksched.NewCycleState(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// filter3 should have received only 1 endpoint (pod1) — the output of filter2.
+	if receivedCount != 1 {
+		t.Errorf("third filter received %d endpoints, want 1 (chained output of previous filters)", receivedCount)
+	}
+}
+
+// orderTrackingFilter records its name into a shared slice when Filter is called.
+type orderTrackingFilter struct {
+	name           string
+	executionOrder *[]string
+}
+
+func (f *orderTrackingFilter) TypedName() fwkplugin.TypedName {
+	return fwkplugin.TypedName{Name: f.name, Type: f.name}
+}
+
+func (f *orderTrackingFilter) Filter(_ context.Context, _ *fwksched.CycleState, _ *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) []fwksched.Endpoint {
+	*f.executionOrder = append(*f.executionOrder, f.name)
+	return endpoints // pass-through
+}
+
+// countingFilter records how many endpoints it received.
+type countingFilter struct {
+	name          string
+	receivedCount *int
+}
+
+func (f *countingFilter) TypedName() fwkplugin.TypedName {
+	return fwkplugin.TypedName{Name: f.name, Type: f.name}
+}
+
+func (f *countingFilter) Filter(_ context.Context, _ *fwksched.CycleState, _ *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) []fwksched.Endpoint {
+	*f.receivedCount = len(endpoints)
+	return endpoints // pass-through
+}
+
+// filterOnlyPlugin implements only the Filter interface (not Scorer or Picker).
+type filterOnlyPlugin struct {
+	typedName fwkplugin.TypedName
+}
+
+func (p *filterOnlyPlugin) TypedName() fwkplugin.TypedName {
+	return p.typedName
+}
+
+func (p *filterOnlyPlugin) Filter(_ context.Context, _ *fwksched.CycleState, _ *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) []fwksched.Endpoint {
+	return endpoints
 }
 
 func findEndpoints(endpoints []fwksched.Endpoint, names ...k8stypes.NamespacedName) []fwksched.Endpoint {

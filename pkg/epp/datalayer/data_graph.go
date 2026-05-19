@@ -18,6 +18,8 @@ package datalayer
 
 import (
 	"errors"
+	"fmt"
+	"reflect"
 	"slices"
 
 	fwkfc "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/flowcontrol"
@@ -32,9 +34,6 @@ import (
 // Further, it validates that the plugins are ordered in a way that respects the layer execution order.
 func ValidateAndOrderDataDependencies(plugins []plugin.Plugin) ([]string, error) {
 	pluginMap := make(map[string]plugin.Plugin)
-	for _, p := range plugins {
-		pluginMap[p.TypedName().String()] = p
-	}
 	for _, p := range plugins {
 		pluginMap[p.TypedName().String()] = p
 	}
@@ -61,6 +60,84 @@ func ValidateAndOrderDataDependencies(plugins []plugin.Plugin) ([]string, error)
 	return pluginNames, nil
 }
 
+// CreateMissingDataProducers inspects the set of already-configured plugins,
+// finds data keys that are consumed but not yet produced, and auto-instantiates
+// the default DataProducer plugin for each such key using nil parameters.
+// defaultProducerRegistry maps a data key to the plugin type that is its default producer.
+// factoryRegistry maps a plugin type to its factory function.
+// Only entries whose type is not already present in plugins are considered.
+func CreateMissingDataProducers(plugins []plugin.Plugin, defaultProducerRegistry map[string]string, factoryRegistry map[string]plugin.FactoryFunc, handle plugin.Handle) ([]plugin.Plugin, error) {
+	// Collect plugin types already present so we don't create duplicates.
+	existingTypes := make(map[string]bool)
+	for _, p := range plugins {
+		existingTypes[p.TypedName().Type] = true
+	}
+
+	// Collect all keys already produced by existing plugins.
+	producedKeys := make(map[string]bool)
+	for _, p := range plugins {
+		if producer, ok := p.(plugin.ProducerPlugin); ok {
+			for key := range producer.Produces() {
+				producedKeys[key] = true
+			}
+		}
+	}
+
+	// Build the set of keys that are consumed but not yet produced.
+	missingKeys := make(map[string]bool)
+	for _, p := range plugins {
+		if consumer, ok := p.(plugin.ConsumerPlugin); ok {
+			for key := range consumer.Consumes() {
+				if !producedKeys[key] {
+					missingKeys[key] = true
+				}
+			}
+		}
+	}
+
+	if len(missingKeys) == 0 {
+		return nil, nil
+	}
+
+	// For each missing key, look up its default producer type and collect unique types to instantiate.
+	// A single producer type may satisfy multiple missing keys; deduplicate by type.
+	neededTypes := make(map[string]string)
+	for key := range missingKeys {
+		pluginType, ok := defaultProducerRegistry[key]
+		if !ok || existingTypes[pluginType] {
+			continue
+		}
+		neededTypes[pluginType] = key
+	}
+
+	var plgns []plugin.Plugin
+	for pluginType, registeredKey := range neededTypes {
+		factory, ok := factoryRegistry[pluginType]
+		if !ok {
+			continue
+		}
+		// pass nil params as this is default instantiation.
+		candidate, err := factory(pluginType, nil, handle)
+		if err != nil {
+			return nil, fmt.Errorf("failed to instantiate data producer %q: %w", pluginType, err)
+		}
+		producer, ok := candidate.(plugin.ProducerPlugin)
+		if !ok || existingTypes[pluginType] {
+			continue
+		}
+
+		// Validate that the instantiated producer produces the registered key.
+		if _, ok := producer.Produces()[registeredKey]; !ok {
+			return nil, fmt.Errorf("instantiated default data producer %q does not produce registered key %q", pluginType, registeredKey)
+		}
+
+		plgns = append(plgns, candidate)
+		existingTypes[pluginType] = true
+	}
+
+	return plgns, nil
+}
+
 // Define constants for layer execution order. Lower value means earlier execution.
 const (
 	FlowControlLayer    = 0
@@ -79,16 +156,16 @@ func pluginToLayerExecutionOrder(plugin plugin.Plugin) int {
 	}
 
 	// Request control plugins
-	if _, ok := plugin.(fwkrq.PrepareDataPlugin); ok {
+	if _, ok := plugin.(fwkrq.DataProducer); ok {
 		return RequestControlLayer
 	}
-	if _, ok := plugin.(fwkrq.AdmissionPlugin); ok {
+	if _, ok := plugin.(fwkrq.Admitter); ok {
 		return RequestControlLayer
 	}
 	if _, ok := plugin.(fwkrq.PreRequest); ok {
 		return RequestControlLayer
 	}
-	if _, ok := plugin.(fwkrq.ResponseReceived); ok {
+	if _, ok := plugin.(fwkrq.ResponseHeaderProcessor); ok {
 		return RequestControlLayer
 	}
 
@@ -129,9 +206,8 @@ func buildDAG(producers map[string]plugin.ProducerPlugin, consumers map[string]p
 			if producer.Produces() != nil && consumer.Consumes() != nil {
 				for producedKey, producedData := range producer.Produces() {
 					if consumedData, ok := consumer.Consumes()[producedKey]; ok {
-						// Check types are same. Reflection is avoided here for simplicity.
-						// TODO(#1985): Document this detail in IGW docs.
-						if producedData != consumedData {
+						// Check types are same.
+						if reflect.TypeOf(producedData) != reflect.TypeOf(consumedData) {
 							return nil, errors.New("data type mismatch between produced and consumed data for key: " + producedKey)
 						}
 						if pluginToLayerExecutionOrder(producer) > pluginToLayerExecutionOrder(consumer) {

@@ -22,14 +22,17 @@ SHELL = /usr/bin/env bash -o pipefail
 .SHELLFLAGS = -ec
 
 GIT_COMMIT_SHA ?= "$(shell git rev-parse HEAD 2>/dev/null)"
-GIT_TAG ?= $(shell git describe --tags --dirty --always)
+# Keep root-module build metadata anchored to top-level release tags so
+# submodule tags such as conformance/v1.5.0 do not leak into image versions.
+ROOT_RELEASE_TAG_MATCH ?= v[0-9]*
+GIT_TAG ?= $(shell git describe --tags --match '$(ROOT_RELEASE_TAG_MATCH)' --dirty --always)
 TARGETARCH ?= $(shell go env GOARCH)
 PLATFORMS ?= linux/$(TARGETARCH)
 DOCKER_BUILDX_CMD ?= docker buildx
 IMAGE_BUILD_CMD ?= $(DOCKER_BUILDX_CMD) build
 IMAGE_BUILD_EXTRA_OPTS ?=
-SYNCER_IMAGE_BUILD_EXTRA_OPTS ?=
 BBR_IMAGE_BUILD_EXTRA_OPTS ?=
+LWEPP_IMAGE_BUILD_EXTRA_OPTS ?=
 LATENCY_TRAINING_IMAGE_BUILD_EXTRA_OPTS ?=
 LATENCY_PREDICTION_IMAGE_BUILD_EXTRA_OPTS ?=
 LATENCY_PREDICTION_TEST_IMAGE_BUILD_EXTRA_OPTS ?=
@@ -50,13 +53,13 @@ E2E_IMAGE ?= $(IMAGE_TAG)
 # the image into the cluster.
 E2E_USE_KIND ?= true
 
-SYNCER_IMAGE_NAME := lora-syncer
-SYNCER_IMAGE_REPO ?= $(IMAGE_REGISTRY)/$(SYNCER_IMAGE_NAME)
-SYNCER_IMAGE_TAG ?= $(SYNCER_IMAGE_REPO):$(GIT_TAG)
-
 BBR_IMAGE_NAME := bbr
 BBR_IMAGE_REPO ?= $(IMAGE_REGISTRY)/$(BBR_IMAGE_NAME)
 BBR_IMAGE_TAG ?= $(BBR_IMAGE_REPO):$(GIT_TAG)
+
+LWEPP_IMAGE_NAME := lwepp
+LWEPP_IMAGE_REPO ?= $(IMAGE_REGISTRY)/$(LWEPP_IMAGE_NAME)
+LWEPP_IMAGE_TAG ?= $(LWEPP_IMAGE_REPO):$(GIT_TAG)
 
 LATENCY_TRAINING_IMAGE_NAME := latency-training-server
 LATENCY_TRAINING_IMAGE_REPO ?= $(IMAGE_REGISTRY)/$(LATENCY_TRAINING_IMAGE_NAME)
@@ -76,11 +79,11 @@ ifdef GO_VERSION
 BUILDER_IMAGE = golang:$(GO_VERSION)
 endif
 
-BUILD_REF ?= $(shell git describe --abbrev=0 2>/dev/null)
+BUILD_REF ?= $(shell git describe --tags --match '$(ROOT_RELEASE_TAG_MATCH)' --abbrev=0 2>/dev/null)
 ifdef EXTRA_TAG
 IMAGE_EXTRA_TAG ?= $(IMAGE_REPO):$(EXTRA_TAG)
-SYNCER_IMAGE_EXTRA_TAG ?= $(SYNCER_IMAGE_REPO):$(EXTRA_TAG)
 BBR_IMAGE_EXTRA_TAG ?= $(BBR_IMAGE_REPO):$(EXTRA_TAG)
+LWEPP_IMAGE_EXTRA_TAG ?= $(LWEPP_IMAGE_REPO):$(EXTRA_TAG)
 LATENCY_TRAINING_IMAGE_EXTRA_TAG ?= $(LATENCY_TRAINING_IMAGE_REPO):$(EXTRA_TAG)
 LATENCY_PREDICTION_IMAGE_EXTRA_TAG ?= $(LATENCY_PREDICTION_IMAGE_REPO):$(EXTRA_TAG)
 LATENCY_PREDICTION_TEST_IMAGE_EXTRA_TAG ?= $(LATENCY_PREDICTION_TEST_IMAGE_REPO):$(EXTRA_TAG)
@@ -88,8 +91,8 @@ BUILD_REF = $(EXTRA_TAG)
 endif
 ifdef IMAGE_EXTRA_TAG
 IMAGE_BUILD_EXTRA_OPTS += -t $(IMAGE_EXTRA_TAG)
-SYNCER_IMAGE_BUILD_EXTRA_OPTS += -t $(SYNCER_IMAGE_EXTRA_TAG)
 BBR_IMAGE_BUILD_EXTRA_OPTS += -t $(BBR_IMAGE_EXTRA_TAG)
+LWEPP_IMAGE_BUILD_EXTRA_OPTS += -t $(LWEPP_IMAGE_EXTRA_TAG)
 LATENCY_TRAINING_IMAGE_BUILD_EXTRA_OPTS += -t $(LATENCY_TRAINING_IMAGE_EXTRA_TAG)
 LATENCY_PREDICTION_IMAGE_BUILD_EXTRA_OPTS += -t $(LATENCY_PREDICTION_IMAGE_EXTRA_TAG)
 LATENCY_PREDICTION_TEST_IMAGE_BUILD_EXTRA_OPTS += -t $(LATENCY_PREDICTION_TEST_IMAGE_EXTRA_TAG)
@@ -123,6 +126,15 @@ generate: controller-gen code-generator tidy ## Generate WebhookConfiguration, C
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate/boilerplate.generatego.txt" paths="./..."
 	$(CONTROLLER_GEN) crd output:dir="./config/crd/bases" paths="./..."
 	./hack/update-codegen.sh
+
+.PHONY: generate-proto
+generate-proto: protoc-gen-go protoc-gen-go-grpc ## Generate Golang code from protobuf files.
+	PATH="$(LOCALBIN):$$PATH" $(PROTOC) \
+		-I pkg/epp/framework/plugins/requesthandling/parsers/vllmgrpc/api/proto \
+		-I . \
+		--go_out=module=sigs.k8s.io/gateway-api-inference-extension:. \
+		--go-grpc_out=module=sigs.k8s.io/gateway-api-inference-extension:. \
+		pkg/epp/framework/plugins/requesthandling/parsers/vllmgrpc/api/proto/*.proto
 
 # Use same code-generator version as k8s.io/api
 CODEGEN_VERSION := $(shell go list -m -f '{{.Version}}' k8s.io/api)
@@ -195,7 +207,7 @@ api-lint: golangci-api-lint
 	$(GOLANGCI_API_LINT) run -c .golangci-kal.yml --timeout 15m0s ./...
 
 .PHONY: verify
-verify: vet fmt-verify generate ci-lint api-lint verify-all verify-fw-imports
+verify: vet fmt-verify generate ci-lint api-lint verify-all verify-fw-imports verify-component-imports
 	git --no-pager diff --exit-code config api client-go
 
 .PHONY: verify-crds
@@ -207,6 +219,13 @@ verify-crds: kubectl-validate
 .PHONY: verify-fw-imports
 verify-fw-imports:
 	go run hack/verify-framework-imports.go
+
+# Verify EPP and BBR do not have cross-component imports.
+# Known exceptions are listed in the script and reported as warnings.
+# New violations fail the check, preventing additional cross-imports.
+.PHONY: verify-component-imports
+verify-component-imports:
+	go run hack/verify-component-imports.go
 
 #If you are running in local and your helm dependency is outdated, you can run `make verify-helm-charts MODE=local`
 .PHONY: verify-helm-charts
@@ -260,30 +279,6 @@ image-load: image-build
 image-kind: image-build ## Build the EPP image and load it to kind cluster $KIND_CLUSTER ("kind" by default).
 	kind load docker-image $(IMAGE_TAG) --name $(KIND_CLUSTER)
 
-##@ Lora Syncer
-
-.PHONY: syncer-image-local-build
-syncer-image-local-build:
-	BUILDER=$(shell $(DOCKER_BUILDX_CMD) create --use)
-	$(MAKE) image-build PUSH=$(PUSH)
-	$(DOCKER_BUILDX_CMD) rm $$BUILDER
-
-.PHONY: syncer-image-local-push
-syncer-image-local-push: PUSH=--push
-syncer-image-local-push: syncer-image-local-build
-
-.PHONY: syncer-image-build
-syncer-image-build:
-	$ cd $(CURDIR)/tools/dynamic-lora-sidecar && $(IMAGE_BUILD_CMD) -t $(SYNCER_IMAGE_TAG) \
-		--platform=$(PLATFORMS) \
-		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
-		--build-arg BUILDER_IMAGE=$(BUILDER_IMAGE) \
-		$(PUSH) \
-		$(SYNCER_IMAGE_BUILD_EXTRA_OPTS) ./
-
-.PHONY: syncer-image-push
-syncer-image-push: PUSH=--push
-syncer-image-push: syncer-image-build
 
 ##@ Body-based Routing extension
 
@@ -324,6 +319,48 @@ bbr-image-load: bbr-image-build
 .PHONY: bbr-image-kind
 bbr-image-kind: bbr-image-build ## Build the image and load it to kind cluster $KIND_CLUSTER ("kind" by default).
 	kind load docker-image $(BBR_IMAGE_TAG) --name $(KIND_CLUSTER)
+
+##@ Lightweight EPP
+
+# Build the container image
+.PHONY: lwepp-image-local-build
+lwepp-image-local-build: ## Build the image using Docker Buildx for local development.
+	BUILDER=$(shell $(DOCKER_BUILDX_CMD) create --use)
+	$(MAKE) lwepp-image-build PUSH=$(PUSH)
+	$(MAKE) lwepp-image-build LOAD=$(LOAD)
+	$(DOCKER_BUILDX_CMD) rm $$BUILDER
+
+.PHONY: lwepp-image-local-push
+lwepp-image-local-push: PUSH=--push ## Build the image for local development and push it to $IMAGE_REPO.
+lwepp-image-local-push: lwepp-image-local-build
+
+.PHONY: lwepp-image-local-load
+lwepp-image-local-load: LOAD=--load ## Build the image for local development and load it in the local Docker registry.
+lwepp-image-local-load: lwepp-image-local-build
+
+.PHONY: lwepp-image-build
+lwepp-image-build: ## Build the image using Docker Buildx.
+	$(IMAGE_BUILD_CMD) -f lwepp.Dockerfile -t $(LWEPP_IMAGE_TAG) \
+		--platform=$(PLATFORMS) \
+		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
+		--build-arg BUILDER_IMAGE=$(BUILDER_IMAGE) \
+		--build-arg COMMIT_SHA=${GIT_COMMIT_SHA} \
+		--build-arg BUILD_REF=${BUILD_REF} \
+		$(PUSH) \
+		$(LOAD) \
+		$(LWEPP_IMAGE_BUILD_EXTRA_OPTS) ./
+
+.PHONY: lwepp-image-push
+lwepp-image-push: PUSH=--push ## Build the image and push it to $IMAGE_REPO.
+lwepp-image-push: lwepp-image-build
+
+.PHONY: lwepp-image-load
+lwepp-image-load: LOAD=--load ## Build the image and load it in the local Docker registry.
+lwepp-image-load: lwepp-image-build
+
+.PHONY: lwepp-image-kind
+lwepp-image-kind: lwepp-image-build ## Build the image and load it to kind cluster $KIND_CLUSTER ("kind" by default).
+	kind load docker-image $(LWEPP_IMAGE_TAG) --name $(KIND_CLUSTER)
 
 ##@ Latency Prediction - Training Server
 
@@ -512,6 +549,10 @@ standalone-helm-chart-push: yq helm-install
 release-quickstart: ## Update the quickstart guide for a release.
 	./hack/release-quickstart.sh
 
+.PHONY: release-tags
+release-tags: ## Create and push signed tags for the root and conformance modules.
+	./hack/release-tags.sh
+
 .PHONY: artifacts
 artifacts: kustomize yq
 	if [ -d artifacts ]; then rm -rf artifacts; fi
@@ -543,6 +584,9 @@ HELM = $(PROJECT_DIR)/bin/helm
 YQ = $(PROJECT_DIR)/bin/yq
 KUBECTL_VALIDATE = $(PROJECT_DIR)/bin/kubectl-validate
 GCI = $(LOCALBIN)/gci
+PROTOC ?= protoc
+PROTOC_GEN_GO = $(LOCALBIN)/protoc-gen-go
+PROTOC_GEN_GO_GRPC = $(LOCALBIN)/protoc-gen-go-grpc
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.4.3
@@ -553,6 +597,8 @@ GOLANGCI_LINT_VERSION ?= v2.9.0
 HELM_VERSION ?= v3.17.1
 KUBECTL_VALIDATE_VERSION ?= v0.0.4
 GCI_VERSION ?= v0.13.6
+PROTOC_GEN_GO_VERSION ?= v1.34.2
+PROTOC_GEN_GO_GRPC_VERSION ?= v1.5.1
 YQ_VERSION ?= v4.45.1
 
 .PHONY: kustomize
@@ -608,6 +654,16 @@ $(KUBECTL_VALIDATE): $(LOCALBIN)
 gci: $(GCI) ## Download gci locally if necessary.
 $(GCI): $(LOCALBIN)
 	$(call go-install-tool,$(GCI),github.com/daixiang0/gci,$(GCI_VERSION))
+
+.PHONY: protoc-gen-go
+protoc-gen-go: $(PROTOC_GEN_GO) ## Download protoc-gen-go locally if necessary.
+$(PROTOC_GEN_GO): $(LOCALBIN)
+	$(call go-install-tool,$(PROTOC_GEN_GO),google.golang.org/protobuf/cmd/protoc-gen-go,$(PROTOC_GEN_GO_VERSION))
+
+.PHONY: protoc-gen-go-grpc
+protoc-gen-go-grpc: $(PROTOC_GEN_GO_GRPC) ## Download protoc-gen-go-grpc locally if necessary.
+$(PROTOC_GEN_GO_GRPC): $(LOCALBIN)
+	$(call go-install-tool,$(PROTOC_GEN_GO_GRPC),google.golang.org/grpc/cmd/protoc-gen-go-grpc,$(PROTOC_GEN_GO_GRPC_VERSION))
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary

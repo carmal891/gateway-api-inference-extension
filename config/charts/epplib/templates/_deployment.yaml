@@ -26,51 +26,74 @@ spec:
         {{- include "gateway-api-inference-extension.selectorLabels" . | nindent 8 }}
         {{- include "gateway-api-inference-extension.modeLabels" . | nindent 8 }}
     spec:
+      {{- $sidecar := include "gateway-api-inference-extension.sidecar" . | fromYaml | default dict }}
+      {{- $proxyType := include "gateway-api-inference-extension.sidecarProxyType" . | trim }}
+      {{- $sidecarConfigMap := index $sidecar "configMap" | default dict }}
+      {{- $sidecarConfigMapName := index $sidecarConfigMap "name" | default "" }}
+      {{- $inferenceExtensionFlags := deepCopy (.Values.inferenceExtension.flags | default dict) }}
+      {{- if and (eq $proxyType "agentgateway") (not (hasKey $inferenceExtensionFlags "secure-serving")) }}
+        {{- $_ := set $inferenceExtensionFlags "secure-serving" false }}
+      {{- end }}
       serviceAccountName: {{ include "gateway-api-inference-extension.name" . }}
       # Conservatively, this timeout should mirror the longest grace period of the pods within the pool
       terminationGracePeriodSeconds: 130
       containers:
-      {{- if .Values.inferenceExtension.sidecar.enabled }}
-        - name: {{ .Values.inferenceExtension.sidecar.name }}
-          image: {{ .Values.inferenceExtension.sidecar.image }}
-          imagePullPolicy: {{ .Values.inferenceExtension.sidecar.imagePullPolicy | default "IfNotPresent" }}
-        {{- with .Values.inferenceExtension.sidecar.command }}
+      {{- if $sidecar.enabled }}
+        - name: {{ $sidecar.name }}
+          image: {{ $sidecar.image }}
+          imagePullPolicy: {{ $sidecar.imagePullPolicy | default "IfNotPresent" }}
+        {{- with $sidecar.command }}
           command:
             - {{ . | quote }}
         {{- end }}
-        {{- with .Values.inferenceExtension.sidecar.args }}
+        {{- with $sidecar.args }}
           args:
           {{- range . }}
             - {{ . | quote }}
           {{- end }}
         {{- end }}
-        {{- with .Values.inferenceExtension.sidecar.env }}
+        {{- with $sidecar.env }}
           env:
           {{- toYaml . | nindent 10 }}
           {{- end }}
-        {{- with .Values.inferenceExtension.sidecar.ports }}
+        {{- with $sidecar.ports }}
           ports:
           {{- toYaml . | nindent 10 }}
         {{- end }}
-        {{- with .Values.inferenceExtension.sidecar.livenessProbe }}
+        {{- with $sidecar.livenessProbe }}
           livenessProbe:
           {{- toYaml . | nindent 12 }}
         {{- end }}
-        {{- with .Values.inferenceExtension.sidecar.readinessProbe }}
+        {{- with $sidecar.readinessProbe }}
           readinessProbe:
           {{- toYaml . | nindent 12 }}
         {{- end }}
-        {{- with .Values.inferenceExtension.sidecar.resources }}
+        {{- with $sidecar.startupProbe }}
+          startupProbe:
+          {{- toYaml . | nindent 12 }}
+        {{- end }}
+        {{- with $sidecar.securityContext }}
+          securityContext:
+          {{- toYaml . | nindent 12 }}
+        {{- end }}
+        {{- with $sidecar.resources }}
           resources:
           {{- toYaml . | nindent 12 }}
         {{- end }}
-        {{- with .Values.inferenceExtension.sidecar.volumeMounts }}
+        {{- if or (and (eq $proxyType "agentgateway") $sidecarConfigMapName) $sidecar.volumeMounts }}
           volumeMounts:
+          {{- if and (eq $proxyType "agentgateway") $sidecarConfigMapName }}
+            - name: agentgateway-config-template
+              mountPath: /config
+              readOnly: true
+          {{- end }}
+          {{- with $sidecar.volumeMounts }}
           {{- toYaml . | nindent 12 }}
+          {{- end }}
         {{- end }}
         {{- end }}
         - name: epp
-          image: {{ .Values.inferenceExtension.image.hub }}/{{ .Values.inferenceExtension.image.name }}:{{ .Values.inferenceExtension.image.tag }}
+          image: {{ .Values.inferenceExtension.image.registry }}/{{ .Values.inferenceExtension.image.repository }}:{{ .Values.inferenceExtension.image.tag }}
           imagePullPolicy: {{ .Values.inferenceExtension.image.pullPolicy | default "IfNotPresent" }}
           args:
           {{- /* 1. Determine Model Server Type Logic */ -}}
@@ -85,30 +108,43 @@ spec:
               - --endpoint-selector
               - {{ .Values.inferenceExtension.endpointsServer.endpointSelector | quote }}
               - --endpoint-target-ports
-              - {{ .Values.inferenceExtension.endpointsServer.targetPorts | quote }}
+              - {{ include "gateway-api-inference-extension.standaloneEndpointTargetPorts" . | quote }}
           {{- else }}
               - --pool-name
               - {{ .Release.Name }}
               # The pool namespace is optional because EPP can default to the NAMESPACE env var.
               - --pool-namespace
               - {{ .Release.Namespace }}
-          {{- if ne .Values.inferencePool.apiVersion "inference.networking.k8s.io" }}
               - --pool-group
-              - "{{ (split "/" .Values.inferencePool.apiVersion)._0 }}"
+              - "inference.networking.k8s.io"
           {{- end }}
-          {{- end }}
-          # SGLang specific metrics.
+          {{- if not .Values.inferenceExtension.latencyPredictor.enabled }}
+          # Legacy metric CLI flags (skipped when dataLayer is enabled via latency predictor).
           {{- if eq $modelServerType "sglang" }}
               - --total-queued-requests-metric="sglang:num_queue_reqs"
+              - --total-running-requests-metric="sglang:num_running_reqs"
               - --kv-cache-usage-percentage-metric="sglang:token_usage"
+              - --cache-info-metric="sglang:cache_config_info"
           {{- end }}
           {{- if eq $modelServerType "triton-tensorrt-llm" }}
               - --total-queued-requests-metric
               - "nv_trt_llm_request_metrics{request_type=waiting}"
+              - --total-running-requests-metric
+              - "nv_trt_llm_request_metrics{request_type=scheduled}"
               - --kv-cache-usage-percentage-metric
               - "nv_trt_llm_kv_cache_block_metrics{kv_cache_block_type=fraction}"
               - --lora-info-metric
               - "" # Set an empty metric to disable LoRA metric scraping as they are not supported by Triton yet.
+          {{- end }}
+          {{- if eq $modelServerType "trtllm-serve" }}
+              - --total-queued-requests-metric="trtllm_num_requests_waiting"
+              - --total-running-requests-metric="trtllm_num_requests_running"
+              - --kv-cache-usage-percentage-metric="trtllm_kv_cache_utilization"
+              - --cache-info-metric="trtllm_cache_config_info"
+              - --model-server-metrics-path="/prometheus/metrics"
+              - --lora-info-metric
+              - "" # LoRA metrics are not supported by trtllm-serve.
+          {{- end }}
           {{- end }}
               - --zap-encoder
               - "json"
@@ -118,9 +154,9 @@ spec:
               - --ha-enable-leader-election
           {{- end }}
               # Pass additional flags via the inferenceExtension.flags field in values.yaml.
-          {{- range $key, $value := .Values.inferenceExtension.flags }}
-              - --{{ $key }}
-              - "{{ $value }}"
+              # Render them as --flag=value so boolean values are parsed correctly.
+          {{- range $key, $value := $inferenceExtensionFlags }}
+              - {{ printf "--%s=%v" $key $value | quote }}
           {{- end }}
           {{- if .Values.inferenceExtension.tracing.enabled }}
               - --tracing=true
@@ -142,7 +178,7 @@ spec:
             - name: metrics
               containerPort: 9090
         {{- if .Values.inferenceExtension.extraContainerPorts }}
-        {{- toYaml .Values.inferenceExtension.extraContainerPorts | nindent 8 }}
+            {{- toYaml .Values.inferenceExtension.extraContainerPorts | nindent 12 }}
         {{- end }}
           livenessProbe:
           {{- if gt (.Values.inferenceExtension.replicas | int) 1 }}
@@ -179,7 +215,7 @@ spec:
         {{- include "gateway-api-inference-extension.latencyPredictor.env" . | nindent 12 }}
         {{- if .Values.inferenceExtension.tracing.enabled }}
             - name: OTEL_SERVICE_NAME
-              value: "gateway-api-inference-extension"
+              value: "gateway-api-inference-extension/epp"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: {{ .Values.inferenceExtension.tracing.otelExporterEndpoint | quote }}
             - name: OTEL_TRACES_EXPORTER
@@ -215,8 +251,16 @@ spec:
       {{- if .Values.inferenceExtension.volumes }}
       {{- toYaml .Values.inferenceExtension.volumes | nindent 8 }}
       {{- end }}
-      {{- if .Values.inferenceExtension.sidecar.volumes }}
-      {{- tpl (toYaml .Values.inferenceExtension.sidecar.volumes) $ | nindent 8 }}
+      {{- if and $sidecar.enabled (eq $proxyType "agentgateway") $sidecarConfigMapName }}
+        - name: agentgateway-config-template
+          configMap:
+            name: {{ $sidecarConfigMapName }}
+            items:
+              - key: config.yaml
+                path: config.yaml
+      {{- end }}
+      {{- with $sidecar.volumes }}
+      {{- tpl (toYaml .) $ | nindent 8 }}
       {{- end }}
         - name: plugins-config-volume
           configMap:

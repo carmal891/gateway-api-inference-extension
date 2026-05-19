@@ -1,5 +1,4 @@
 //go:build ignore
-// +build ignore
 
 /*
 Copyright 2026 The Kubernetes Authors.
@@ -46,7 +45,10 @@ var (
 // globalExceptions are paths that are always allowed for all framework files.
 // These are utility packages that the framework is permitted to import.
 var globalExceptions = []string{
+	"api/v1",
 	"pkg/common/observability/logging",
+	"pkg/common/error",
+	"pkg/common/request",
 }
 
 // currentCodeExceptionMap maps existing violation in files to their allowed import exceptions.
@@ -58,42 +60,37 @@ var currentCodeExceptionMap = map[string][]string{
 	"pkg/epp/framework/plugins/requestcontrol/test/responsereceived/destination_endpoint_served_verifier_test.go": {
 		"pkg/epp/metadata",
 	},
-	"pkg/epp/framework/plugins/scheduling/scorer/predictedlatency/headers.go": {
-		"pkg/epp/util/error",
-	},
-	"pkg/epp/framework/plugins/scheduling/scorer/predictedlatency/latencypredictor_helper.go": {
+	"pkg/epp/framework/plugins/scheduling/scorer/prefix/plugin.go": {
 		"pkg/epp/metrics",
-		"pkg/epp/util/request",
+	},
+	"pkg/epp/framework/plugins/requestcontrol/dataproducer/predictedlatency/plugin.go": {
 		"sidecars/latencypredictorasync",
 	},
-	"pkg/epp/framework/plugins/scheduling/scorer/predictedlatency/latencypredictor_helper_test.go": {
-		"sidecars/latencypredictorasync",
-	},
-	"pkg/epp/framework/plugins/scheduling/scorer/predictedlatency/prediction.go": {
-		"sidecars/latencypredictorasync",
-	},
-	"pkg/epp/framework/plugins/scheduling/scorer/predictedlatency/requestcontrol_hooks.go": {
-		"pkg/epp/metrics",
-		"pkg/epp/util/request",
-	},
-	"pkg/epp/framework/plugins/scheduling/scorer/predictedlatency/requestcontrol_hooks_test.go": {
-		"pkg/epp/util/request",
-	},
-	"pkg/epp/framework/plugins/scheduling/scorer/predictedlatency/scorer.go": {
-		"sidecars/latencypredictorasync",
-	},
-	"pkg/epp/framework/plugins/scheduling/scorer/predictedlatency/scorer_helpers.go": {
-		"pkg/epp/util/error",
-	},
-	"pkg/epp/framework/plugins/scheduling/scorer/predictedlatency/scorer_test.go": {
-		"pkg/epp/util/request",
+	"pkg/epp/framework/plugins/requestcontrol/dataproducer/predictedlatency/plugin_test.go": {
 		"sidecars/latencypredictorasync",
 		"test/utils",
 	},
-	"pkg/epp/framework/plugins/scheduling/scorer/prefix/indexer.go": {
+	"pkg/epp/framework/plugins/requestcontrol/dataproducer/predictedlatency/prediction.go": {
+		"sidecars/latencypredictorasync",
+	},
+	"pkg/epp/framework/plugins/requestcontrol/dataproducer/predictedlatency/prediction_test.go": {
+		"sidecars/latencypredictorasync",
+	},
+	"pkg/epp/framework/plugins/requestcontrol/dataproducer/predictedlatency/requestcontrol_hooks.go": {
+		"pkg/epp/metrics",
+		"sidecars/latencypredictorasync",
+	},
+	"pkg/epp/framework/plugins/requestcontrol/dataproducer/predictedlatency/training.go": {
+		"pkg/epp/metrics",
+		"sidecars/latencypredictorasync",
+	},
+	"pkg/epp/framework/plugins/requestcontrol/dataproducer/predictedlatency/training_test.go": {
+		"sidecars/latencypredictorasync",
+	},
+	"pkg/epp/framework/plugins/requestcontrol/dataproducer/approximateprefix/indexer.go": {
 		"pkg/epp/metrics",
 	},
-	"pkg/epp/framework/plugins/scheduling/scorer/prefix/plugin.go": {
+	"pkg/epp/framework/plugins/requestcontrol/dataproducer/approximateprefix/plugin.go": {
 		"pkg/epp/metrics",
 	},
 }

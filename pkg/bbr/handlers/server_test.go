@@ -18,54 +18,53 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
+	"strconv"
 	"testing"
 
 	basepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/protobuf/testing/protocmp"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/bbr/framework"
+	"sigs.k8s.io/gateway-api-inference-extension/pkg/bbr/plugins/basemodelextractor"
+	"sigs.k8s.io/gateway-api-inference-extension/pkg/bbr/plugins/bodyfieldtoheader"
+	envoytest "sigs.k8s.io/gateway-api-inference-extension/pkg/common/envoy/test"
 	logutil "sigs.k8s.io/gateway-api-inference-extension/pkg/common/observability/logging"
+	"sigs.k8s.io/gateway-api-inference-extension/test/utils"
 )
 
-func TestProcessRequestBody(t *testing.T) {
+func TestHandleRequestBodyStreaming(t *testing.T) {
 	ctx := logutil.NewTestLoggerIntoContext(context.Background())
 
+	b, _ := json.Marshal(map[string]any{"model": "foo"})
 	cases := []struct {
 		desc      string
 		streaming bool
-		bodys     []*extProcPb.HttpBody
+		body      []byte
 		want      []*extProcPb.ProcessingResponse
 	}{
 		{
 			desc: "no-streaming",
-			bodys: []*extProcPb.HttpBody{
-				{
-					Body: mapToBytes(t, map[string]any{
-						"model": "foo",
-					}),
-				},
-			},
+			body: b,
 			want: []*extProcPb.ProcessingResponse{
 				{
 					Response: &extProcPb.ProcessingResponse_RequestBody{
 						RequestBody: &extProcPb.BodyResponse{
 							Response: &extProcPb.CommonResponse{
-								// Necessary so that the new headers are used in the routing decision.
 								ClearRouteCache: true,
 								HeaderMutation: &extProcPb.HeaderMutation{
 									SetHeaders: []*basepb.HeaderValueOption{
 										{
 											Header: &basepb.HeaderValue{
-												Key:      modelHeader,
+												Key:      bodyfieldtoheader.ModelHeader,
 												RawValue: []byte("foo"),
 											},
 										},
 										{
 											Header: &basepb.HeaderValue{
-												Key:      baseModelHeader,
+												Key:      basemodelextractor.BaseModelHeader,
 												RawValue: []byte(""),
 											},
 										},
@@ -80,16 +79,7 @@ func TestProcessRequestBody(t *testing.T) {
 		{
 			desc:      "streaming",
 			streaming: true,
-			bodys: []*extProcPb.HttpBody{
-				{
-					Body: mapToBytes(t, map[string]any{
-						"model": "foo",
-					}),
-				},
-				{
-					EndOfStream: true,
-				},
-			},
+			body:      b,
 			want: []*extProcPb.ProcessingResponse{
 				{
 					Response: &extProcPb.ProcessingResponse_RequestHeaders{
@@ -100,13 +90,19 @@ func TestProcessRequestBody(t *testing.T) {
 									SetHeaders: []*basepb.HeaderValueOption{
 										{
 											Header: &basepb.HeaderValue{
-												Key:      modelHeader,
+												Key:      contentLengthHeader,
+												RawValue: []byte(strconv.Itoa(len(b))),
+											},
+										},
+										{
+											Header: &basepb.HeaderValue{
+												Key:      bodyfieldtoheader.ModelHeader,
 												RawValue: []byte("foo"),
 											},
 										},
 										{
 											Header: &basepb.HeaderValue{
-												Key:      baseModelHeader,
+												Key:      basemodelextractor.BaseModelHeader,
 												RawValue: []byte(""),
 											},
 										},
@@ -123,9 +119,7 @@ func TestProcessRequestBody(t *testing.T) {
 								BodyMutation: &extProcPb.BodyMutation{
 									Mutation: &extProcPb.BodyMutation_StreamedResponse{
 										StreamedResponse: &extProcPb.StreamedBodyResponse{
-											Body: mapToBytes(t, map[string]any{
-												"model": "foo",
-											}),
+											Body:        b,
 											EndOfStream: true,
 										},
 									},
@@ -137,29 +131,126 @@ func TestProcessRequestBody(t *testing.T) {
 			},
 		},
 	}
-
+	baseModelToHeaderPlugin := &basemodelextractor.BaseModelToHeaderPlugin{AdaptersStore: basemodelextractor.NewAdaptersStore()}
 	for _, tc := range cases {
 		t.Run(tc.desc, func(t *testing.T) {
-			srv := NewServer(tc.streaming, &fakeDatastore{}, []framework.PayloadProcessor{})
-			streamedBody := &streamedBody{}
-			for i, body := range tc.bodys {
-				got, err := srv.processRequestBody(context.Background(), body, streamedBody, log.FromContext(ctx))
-				if err != nil {
-					t.Fatalf("processRequestBody(): %v", err)
-				}
+			modelToHeaderPlugin, _ := bodyfieldtoheader.NewBodyFieldToHeaderPlugin(modelField, bodyfieldtoheader.ModelHeader)
+			srv := NewServer(tc.streaming, []framework.RequestProcessor{modelToHeaderPlugin, baseModelToHeaderPlugin}, []framework.ResponseProcessor{})
+			reqCtx := &RequestContext{
+				CycleState: framework.NewCycleState(),
+				Request:    framework.NewInferenceRequest(),
+			}
+			got, err := srv.HandleRequestBody(ctx, reqCtx, tc.body)
+			if err != nil {
+				t.Fatalf("HandleRequestBody(): %v", err)
+			}
 
-				if i == len(tc.bodys)-1 {
-					if diff := cmp.Diff(tc.want, got, protocmp.Transform()); diff != "" {
-						t.Errorf("processRequestBody returned unexpected response, diff(-want, +got): %v", diff)
-					}
-				}
+			// sort headers in responses for deterministic tests
+			envoytest.SortSetHeadersInResponses(tc.want)
+			envoytest.SortSetHeadersInResponses(got)
+			if diff := cmp.Diff(tc.want, got, protocmp.Transform()); diff != "" {
+				t.Errorf("HandleRequestBody returned unexpected response, diff(-want, +got): %v", diff)
 			}
 		})
 	}
 }
 
-type fakeDatastore struct{}
+func TestHandleResponseBody_Streaming(t *testing.T) {
+	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+	wantFullBody := []byte(`{"choices":[{"text":"Hello!"}]}`)
 
-func (ds *fakeDatastore) GetBaseModel(modelName string) string {
-	return ""
+	ref := NewServer(true, []framework.RequestProcessor{}, []framework.ResponseProcessor{})
+	want, err := ref.HandleResponseBody(ctx, newTestRequestContext(), wantFullBody)
+	if err != nil {
+		t.Fatalf("reference HandleResponseBody: %v", err)
+	}
+
+	type chunk struct {
+		body        []byte
+		endOfStream bool
+	}
+	tests := []struct {
+		name   string
+		chunks []chunk
+	}{
+		{
+			name: "single chunk with EoS",
+			chunks: []chunk{
+				{body: wantFullBody, endOfStream: true},
+			},
+		},
+		{
+			name: "split JSON across two chunks, EoS on last",
+			chunks: []chunk{
+				{body: []byte(`{"choices":[{"te`), endOfStream: false},
+				{body: []byte(`xt":"Hello!"}]}`), endOfStream: true},
+			},
+		},
+		{
+			name: "fragmented: three chunks, EoS on last",
+			chunks: []chunk{
+				{body: []byte(`{"choices":`), endOfStream: false},
+				{body: []byte(`[{"text":"Hello!"}]`), endOfStream: false},
+				{body: []byte(`}`), endOfStream: true},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			streamCtx, cancel := context.WithCancel(logutil.NewTestLoggerIntoContext(context.Background()))
+			srv := NewServer(true, []framework.RequestProcessor{}, []framework.ResponseProcessor{})
+			testListener, errChan := utils.SetupTestStreamingServer(t, streamCtx, srv)
+			process, conn := utils.GetStreamingServerClient(streamCtx, t)
+			defer conn.Close()
+			defer func() {
+				cancel()
+				<-errChan
+				testListener.Close()
+			}()
+
+			respHeaders := utils.BuildEnvoyGRPCHeaders(map[string]string{
+				"x-test":       "body",
+				":method":      "POST",
+				"content-type": "text/event-stream",
+			}, true)
+			request := &extProcPb.ProcessingRequest{
+				Request: &extProcPb.ProcessingRequest_ResponseHeaders{
+					ResponseHeaders: respHeaders,
+				},
+			}
+			if err := process.Send(request); err != nil {
+				t.Fatalf("send response headers: %v", err)
+			}
+
+			for _, c := range tc.chunks {
+				request = &extProcPb.ProcessingRequest{
+					Request: &extProcPb.ProcessingRequest_ResponseBody{
+						ResponseBody: &extProcPb.HttpBody{
+							Body:        c.body,
+							EndOfStream: c.endOfStream,
+						},
+					},
+				}
+				if err := process.Send(request); err != nil {
+					t.Fatalf("send response body chunk: %v", err)
+				}
+			}
+
+			got := make([]*extProcPb.ProcessingResponse, 0, len(want))
+			for range want {
+				msg, err := process.Recv()
+				if err != nil {
+					t.Fatalf("recv response phase: %v", err)
+				}
+				got = append(got, msg)
+			}
+
+			envoytest.SortSetHeadersInResponses(want)
+			envoytest.SortSetHeadersInResponses(got)
+			if diff := cmp.Diff(want, got, protocmp.Transform()); diff != "" {
+				t.Errorf("unexpected ProcessingResponse after buffered streaming response body, diff(-want, +got): %s", diff)
+			}
+		})
+	}
 }

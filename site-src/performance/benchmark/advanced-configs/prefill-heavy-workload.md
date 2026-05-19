@@ -12,9 +12,9 @@ Before you begin, ensure you have the following:
 
 Follow [benchmarking guide](https://gateway-api-inference-extension.sigs.k8s.io/performance/benchmark/#benchmark) for more information on how to set up gateway and how to validate benchmark results.
 
-## Infinity Instruct Dataset Configuration
+## Billsum Conversations Dataset Configuration
 
-The chart uses the `infinity_instruct` [dataset type](https://huggingface.co/datasets/BAAI/Infinity-Instruct). 
+The chart uses the `billsum_conversations` [dataset type](https://huggingface.co/datasets/FiscalNote/billsum). 
 
 >NOTE: Currently, we need to download and supply the dataset for inference-perf to ingest. Currently using helm, we can supply the dataset by uploading to a gcs or s3 bucket. Otherwise, you can follow inference perf guides to run locally with a local dataset file path.
 
@@ -35,7 +35,7 @@ cd gateway-api-inference-extension/benchmarking/single-workload
   # Get gateway IP
   GW_IP=$(kubectl get gateway/inference-gateway -o jsonpath='{.status.addresses[0].value}')
   # Get LoadBalancer k8s service IP
-  SVC_IP=$(kubectl get service/vllm-llama3-8b-instruct -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+  SVC_IP=$(kubectl get service/vllm-qwen3-32b -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
 
   echo $GW_IP
   echo $SVC_IP
@@ -140,3 +140,4 @@ The following E2E test runs on GitHub using GitHub Actions.
 | Test name	| Link | PR comment trigger
 | :--- | :--- | :--- |
 | GKE Prefill Heavy Test | https://github.com/gateway-api-inference-extension/.github/workflows/e2e-prefill-heavy-gke.yaml | /run-gke-prefill-heavy |
+| GKE Prefill Heavy Test with Standalone EPP	| https://github.com/gateway-api-inference-extension/.github/workflows/e2e-prefill-heavy-gke-standlone-epp.yaml | /run-gke-prefill-heavy-standalone-epp |

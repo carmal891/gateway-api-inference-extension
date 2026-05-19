@@ -26,6 +26,7 @@ import (
 
 	logutil "sigs.k8s.io/gateway-api-inference-extension/pkg/common/observability/logging"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/datalayer"
+	fwkdl "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/datalayer"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/metrics"
 )
 
@@ -63,8 +64,8 @@ func StartMetricsLogger(ctx context.Context, datastore datalayer.PoolInfo, refre
 					return
 				case <-ticker.C:
 					podsWithFreshMetrics := datastore.PodList(PodsWithFreshMetrics(metricsStalenessThreshold))
-					podsWithStaleMetrics := datastore.PodList(func(pm PodMetrics) bool {
-						return time.Since(pm.GetMetrics().UpdateTime) > metricsStalenessThreshold
+					podsWithStaleMetrics := datastore.PodList(func(ep fwkdl.Endpoint) bool {
+						return time.Since(ep.GetMetrics().UpdateTime) > metricsStalenessThreshold
 					})
 					s := fmt.Sprintf("Current Pods and metrics gathered. Fresh metrics: %+v, Stale metrics: %+v", podsWithFreshMetrics, podsWithStaleMetrics)
 					logger.V(logutil.VERBOSE).Info(s)
@@ -84,6 +85,7 @@ func refreshPrometheusMetrics(logger logr.Logger, datastore datalayer.PoolInfo, 
 
 	var kvCacheTotal float64
 	var queueTotal int
+	var runningRequestsTotal int
 
 	podMetrics := datastore.PodList(PodsWithFreshMetrics(metricsStalenessThreshold))
 	logger.V(logutil.TRACE).Info("Refreshing Prometheus Metrics", "ReadyPods", len(podMetrics))
@@ -97,8 +99,10 @@ func refreshPrometheusMetrics(logger logr.Logger, datastore datalayer.PoolInfo, 
 	for _, pod := range podMetrics {
 		kvCacheTotal += pod.GetMetrics().KVCacheUsagePercent
 		queueTotal += pod.GetMetrics().WaitingQueueSize
+		runningRequestsTotal += pod.GetMetrics().RunningRequestsSize
 	}
 
 	metrics.RecordInferencePoolAvgKVCache(pool.Name, kvCacheTotal/float64(podTotalCount))
-	metrics.RecordInferencePoolAvgQueueSize(pool.Name, float64(queueTotal/podTotalCount))
+	metrics.RecordInferencePoolAvgQueueSize(pool.Name, float64(queueTotal)/float64(podTotalCount))
+	metrics.RecordInferencePoolAvgRunningRequests(pool.Name, float64(runningRequestsTotal)/float64(podTotalCount))
 }

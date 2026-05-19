@@ -93,10 +93,11 @@ done
 declare -A test_cases_standalone
 
 # InferencePool Helm Chart test cases
-test_cases_standalone["basic"]="--set inferenceExtension.endpointsServer.endpointSelector='app=llm-instance-gateway --set inferenceExtension.endpointsServer.createInferencePool=false"
+test_cases_standalone["basic"]="--set inferenceExtension.endpointsServer.endpointSelector=app=llm-instance-gateway --set inferenceExtension.endpointsServer.createInferencePool=false"
 test_cases_standalone["gke-provider"]="--set provider.name=gke --set inferenceExtension.endpointsServer.endpointSelector='app=llm-instance-gateway' --set inferenceExtension.endpointsServer.createInferencePool=false"
 test_cases_standalone["latency-predictor"]="--set inferenceExtension.latencyPredictor.enabled=true --set inferenceExtension.endpointsServer.endpointSelector='app=llm-instance-gateway' --set inferenceExtension.endpointsServer.createInferencePool=false"
 test_cases_standalone["inferencepool"]="--set inferenceExtension.endpointsServer.createInferencePool=true --set inferencePool.modelServers.matchLabels.app=llm-instance-gateway"
+test_cases_standalone["agentgateway"]="--set inferenceExtension.sidecar.proxyType=agentgateway --set inferenceExtension.endpointsServer.endpointSelector='app=llm-instance-gateway' --set inferenceExtension.endpointsServer.createInferencePool=false"
 
 
 echo "Processing dependencies for standalone chart..."
@@ -127,3 +128,83 @@ for key in "${!test_cases_standalone[@]}"; do
   echo "Test case ${key} passed validation."
 done
 
+echo "Running standalone negative validation tests..."
+invalid_proxy_command="${SCRIPT_ROOT}/bin/helm template ${SCRIPT_ROOT}/config/charts/standalone --set inferenceExtension.endpointsServer.endpointSelector='app=llm-instance-gateway' --set inferenceExtension.endpointsServer.createInferencePool=false --set inferenceExtension.sidecar.proxyType=bogus >/dev/null"
+echo "Executing: ${invalid_proxy_command}"
+if eval "${invalid_proxy_command}"; then
+  echo "Helm template unexpectedly succeeded for invalid proxyType"
+  exit 1
+fi
+
+unsupported_agentgateway_inferencepool_command="${SCRIPT_ROOT}/bin/helm template ${SCRIPT_ROOT}/config/charts/standalone --set inferenceExtension.sidecar.proxyType=agentgateway --set inferenceExtension.endpointsServer.createInferencePool=true --set inferencePool.modelServers.matchLabels.app=llm-instance-gateway >/dev/null"
+echo "Executing: ${unsupported_agentgateway_inferencepool_command}"
+if eval "${unsupported_agentgateway_inferencepool_command}"; then
+  echo "Helm template unexpectedly succeeded for unsupported agentgateway createInferencePool=true configuration"
+  exit 1
+fi
+
+unsupported_agentgateway_listener_port_command="${SCRIPT_ROOT}/bin/helm template ${SCRIPT_ROOT}/config/charts/standalone --set inferenceExtension.sidecar.proxyType=agentgateway --set inferenceExtension.endpointsServer.endpointSelector='app=llm-instance-gateway' --set inferenceExtension.endpointsServer.createInferencePool=false --set 'inferenceExtension.extraServicePorts[0].name=proxy' --set 'inferenceExtension.extraServicePorts[0].port=9000' --set 'inferenceExtension.extraServicePorts[0].protocol=TCP' --set 'inferenceExtension.extraServicePorts[0].targetPort=9000' >/dev/null"
+echo "Executing: ${unsupported_agentgateway_listener_port_command}"
+if eval "${unsupported_agentgateway_listener_port_command}"; then
+  echo "Helm template unexpectedly succeeded without an agentgateway listener Service port named http"
+  exit 1
+fi
+
+mismatched_agentgateway_listener_target_port_command="${SCRIPT_ROOT}/bin/helm template ${SCRIPT_ROOT}/config/charts/standalone --set inferenceExtension.sidecar.proxyType=agentgateway --set inferenceExtension.endpointsServer.endpointSelector='app=llm-instance-gateway' --set inferenceExtension.endpointsServer.createInferencePool=false --set 'inferenceExtension.extraServicePorts[0].name=http' --set 'inferenceExtension.extraServicePorts[0].port=9000' --set 'inferenceExtension.extraServicePorts[0].protocol=TCP' --set 'inferenceExtension.extraServicePorts[0].targetPort=9001' >/dev/null"
+echo "Executing: ${mismatched_agentgateway_listener_target_port_command}"
+if eval "${mismatched_agentgateway_listener_target_port_command}"; then
+  echo "Helm template unexpectedly succeeded for an agentgateway listener targetPort that does not match port"
+  exit 1
+fi
+
+echo "Verifying standalone extra flags render as --flag=value..."
+flag_render_output="${TEMP_DIR}/standalone-flag-render.yaml"
+flag_render_command="${SCRIPT_ROOT}/bin/helm template ${SCRIPT_ROOT}/config/charts/standalone --set inferenceExtension.endpointsServer.endpointSelector='app=llm-instance-gateway' --set inferenceExtension.endpointsServer.createInferencePool=false --set-string inferenceExtension.flags.secure-serving=false > ${flag_render_output}"
+echo "Executing: ${flag_render_command}"
+eval "${flag_render_command}"
+if ! grep -q -- '--secure-serving=false' "${flag_render_output}"; then
+  echo "Helm template did not render extra flags as --flag=value"
+  exit 1
+fi
+
+echo "Verifying standalone agentgateway renders plaintext EPP and custom listener ports..."
+agentgateway_render_output="${TEMP_DIR}/standalone-agentgateway-render.yaml"
+agentgateway_render_command="${SCRIPT_ROOT}/bin/helm template ${SCRIPT_ROOT}/config/charts/standalone --set inferenceExtension.sidecar.proxyType=agentgateway --set inferenceExtension.endpointsServer.endpointSelector='app=llm-instance-gateway' --set inferenceExtension.endpointsServer.createInferencePool=false --set 'inferenceExtension.extraServicePorts[0].name=http' --set 'inferenceExtension.extraServicePorts[0].port=9000' --set 'inferenceExtension.extraServicePorts[0].protocol=TCP' --set 'inferenceExtension.extraServicePorts[0].targetPort=http' > ${agentgateway_render_output}"
+echo "Executing: ${agentgateway_render_command}"
+eval "${agentgateway_render_command}"
+if ! grep -q -- '--secure-serving=false' "${agentgateway_render_output}"; then
+  echo "Agentgateway Helm template did not render plaintext EPP serving"
+  exit 1
+fi
+if ! grep -q -- 'containerPort: 9000' "${agentgateway_render_output}"; then
+  echo "Agentgateway Helm template did not render the custom listener containerPort"
+  exit 1
+fi
+if ! grep -A1 -- 'containerPort: 9000' "${agentgateway_render_output}" | grep -q -- 'name: http'; then
+  echo "Agentgateway Helm template did not render the listener containerPort named http"
+  exit 1
+fi
+if ! grep -q -- '    - port: 9000' "${agentgateway_render_output}"; then
+  echo "Agentgateway Helm template did not render the custom listener bind port"
+  exit 1
+fi
+if ! grep -q -- 'destinationMode: passthrough' "${agentgateway_render_output}"; then
+  echo "Agentgateway Helm template did not render passthrough destination mode"
+  exit 1
+fi
+if ! grep -q -- 'name: "default/llm-instance-gateway"' "${agentgateway_render_output}"; then
+  echo "Agentgateway Helm template did not derive the logical backend name from endpointSelector"
+  exit 1
+fi
+if ! grep -q -- 'hostname: "llm-instance-gateway"' "${agentgateway_render_output}"; then
+  echo "Agentgateway Helm template did not derive the logical backend hostname from endpointSelector"
+  exit 1
+fi
+if grep -q -- 'standalone/templates/agentgateway-service.yaml' "${agentgateway_render_output}"; then
+  echo "Agentgateway Helm template unexpectedly rendered a model Service"
+  exit 1
+fi
+if grep -q -- 'agentgateway-model-service' "${agentgateway_render_output}"; then
+  echo "Agentgateway Helm template unexpectedly rendered model Service labels"
+  exit 1
+fi

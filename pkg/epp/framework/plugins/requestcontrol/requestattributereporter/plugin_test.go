@@ -27,11 +27,9 @@ import (
 
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/datalayer"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/requestcontrol"
+	fwkrh "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/requesthandling"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/scheduling"
 )
-
-// Test interface satisfaction at compile time.
-var _ requestcontrol.ResponseComplete = &Plugin{}
 
 func TestPluginCreation(t *testing.T) {
 	tests := []struct {
@@ -172,6 +170,7 @@ func TestPluginCreation(t *testing.T) {
 			}
 			if plugin == nil {
 				t.Fatalf("New() returned nil plugin without error")
+				return
 			}
 
 			attributeKey := plugin.config.Attributes[0].Key
@@ -202,7 +201,7 @@ func TestValueReporting(t *testing.T) {
 				},
 			},
 			response: &requestcontrol.Response{
-				Usage: requestcontrol.Usage{
+				Usage: fwkrh.Usage{
 					PromptTokens: 15,
 				},
 			},
@@ -234,23 +233,11 @@ func TestValueReporting(t *testing.T) {
 				},
 			},
 			response: &requestcontrol.Response{
-				Usage: requestcontrol.Usage{
+				Usage: fwkrh.Usage{
 					PromptTokens: 0,
 				},
 			},
-			wantResult: &structpb.Struct{
-				Fields: map[string]*structpb.Value{
-					defaultNamespace: {
-						Kind: &structpb.Value_StructValue{
-							StructValue: &structpb.Struct{
-								Fields: map[string]*structpb.Value{
-									"prompt_tokens": {Kind: &structpb.Value_NumberValue{NumberValue: 0}},
-								},
-							},
-						},
-					},
-				},
-			},
+			wantResult: nil, // Expect early return for zero value
 		},
 		{
 			name: "condition not met",
@@ -266,7 +253,7 @@ func TestValueReporting(t *testing.T) {
 				},
 			},
 			response: &requestcontrol.Response{
-				Usage: requestcontrol.Usage{
+				Usage: fwkrh.Usage{
 					PromptTokens: 10,
 				},
 				DynamicMetadata: &structpb.Struct{
@@ -295,7 +282,7 @@ func TestValueReporting(t *testing.T) {
 				},
 			},
 			response: &requestcontrol.Response{
-				Usage: requestcontrol.Usage{
+				Usage: fwkrh.Usage{
 					PromptTokens: 10,
 				},
 			},
@@ -314,7 +301,7 @@ func TestValueReporting(t *testing.T) {
 				},
 			},
 			response: &requestcontrol.Response{
-				Usage: requestcontrol.Usage{
+				Usage: fwkrh.Usage{
 					PromptTokens: 10,
 				},
 			},
@@ -333,7 +320,7 @@ func TestValueReporting(t *testing.T) {
 				},
 			},
 			response: &requestcontrol.Response{
-				Usage: requestcontrol.Usage{
+				Usage: fwkrh.Usage{
 					PromptTokens: 10,
 				},
 			},
@@ -352,21 +339,9 @@ func TestValueReporting(t *testing.T) {
 				},
 			},
 			response: &requestcontrol.Response{
-				Usage: requestcontrol.Usage{}, // Empty usage
+				Usage: fwkrh.Usage{}, // Empty usage
 			},
-			wantResult: &structpb.Struct{
-				Fields: map[string]*structpb.Value{
-					defaultNamespace: {
-						Kind: &structpb.Value_StructValue{
-							StructValue: &structpb.Struct{
-								Fields: map[string]*structpb.Value{
-									"total_tokens": {Kind: &structpb.Value_NumberValue{NumberValue: 0}},
-								},
-							},
-						},
-					},
-				},
-			},
+			wantResult: nil, // Expect early return for zero value
 		},
 		{
 			name: "partial usage fields missing with has() guards",
@@ -381,7 +356,7 @@ func TestValueReporting(t *testing.T) {
 				},
 			},
 			response: &requestcontrol.Response{
-				Usage: requestcontrol.Usage{
+				Usage: fwkrh.Usage{
 					CompletionTokens: 25,
 				},
 			},
@@ -405,7 +380,8 @@ func TestValueReporting(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Clone the initial response object for each subtest
 			currentResponse := &requestcontrol.Response{
-				Usage: tt.response.Usage,
+				EndOfStream: true,
+				Usage:       tt.response.Usage,
 			}
 			if tt.response.DynamicMetadata != nil {
 				currentResponse.DynamicMetadata = proto.Clone(tt.response.DynamicMetadata).(*structpb.Struct)
@@ -416,7 +392,7 @@ func TestValueReporting(t *testing.T) {
 				t.Fatalf("Failed to create plugin: %v", err)
 			}
 
-			plugin.ResponseComplete(context.Background(), &scheduling.LLMRequest{}, currentResponse, &datalayer.EndpointMetadata{})
+			plugin.ResponseBody(context.Background(), &scheduling.InferenceRequest{}, currentResponse, &datalayer.EndpointMetadata{})
 
 			if diff := cmp.Diff(tt.wantResult, currentResponse.DynamicMetadata, protocmp.Transform()); diff != "" {
 				t.Errorf("ResponseComplete() DynamicMetadata mismatch (-want +got):\n%s", diff)

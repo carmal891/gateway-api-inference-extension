@@ -142,7 +142,7 @@ Supporting this broad range of extension capabilities (including for inference, 
 Several implementations can be used as references:
 
 - A fully featured [reference implementation](https://github.com/envoyproxy/envoy/tree/main/source/extensions/filters/http/ext_proc) (C++) can be found in the Envoy GitHub repository.
-- A second implementation (Rust, non-Envoy) is available in [agentgateway](https://github.com/agentgateway/agentgateway/blob/v0.7.2/crates/agentgateway/src/http/ext_proc.rs).
+- A second implementation (Rust, non-Envoy) is available in [agentgateway](https://github.com/agentgateway/agentgateway/blob/v1.0.0/crates/agentgateway/src/http/ext_proc.rs).
 
 #### Portable Implementation
 
@@ -151,6 +151,56 @@ A portable WASM module implementing ext_proc can be developed, leveraging the [P
 A challenge to this option is that Proxy-Wasm becomes a dependency and may need to evolve in conjunction with ext_proc. With that said, this is very unlikely to be a problem in practice, given the breadth of Proxy-Wasm’s ABI and the use cases in scope of the ext_proc protocol.
 
 An example of a similar approach is Kuadrant’s [WASM Shim](https://github.com/Kuadrant/wasm-shim/tree/main), which implements the protocols required by External Authorization and Rate Limiting Service APIs as a WASM module.
+
+## Managing InferencePool Status
+
+### Ownership Model
+
+InferencePool follows a **shared ownership model**, similar to Kubernetes Services.
+Multiple controllers may manage the same InferencePool concurrently. Implementations:
+
+- **MUST NOT** use labels, `ownerReferences`, or other mechanisms to claim
+  exclusive ownership of an InferencePool.
+- **SHOULD** assume that other controllers may also be reconciling the same
+  InferencePool.
+
+This design mirrors how Kubernetes Services work, a Service is a backend resource
+that can be referenced by multiple Ingresses or Routes from different controllers.
+Similarly, the same InferencePool may be referenced as a `backendRef` by multiple
+HTTPRoutes attached to different Gateways managed by different implementations.
+Using `ownerReferences` or labels to claim exclusive ownership would prevent this
+multi-Gateway scenario from working correctly, as one controller's ownership claim
+would conflict with another's. Instead, each controller independently tracks its
+relationship to the InferencePool through its own status entry (see below).
+
+### Status Management
+
+The InferencePool status supports multiple parents (up to 32, consistent with the
+[Gateway API RouteStatus convention](https://github.com/kubernetes-sigs/gateway-api/blob/v1.5.1/apis/v1/shared_types.go)),
+allowing each Gateway implementation to independently report its own status:
+
+```yaml
+status:
+  parents:
+    - parentRef:
+        group: gateway.networking.k8s.io
+        kind: Gateway
+        name: my-gateway
+      conditions:
+        - type: Accepted
+          status: "True"
+```
+
+Key guidelines:
+
+- **Parent should be the Gateway**, not the xRoute. A single xRoute may be
+  attached to multiple Gateways, so Gateway serves as the unique identifier
+  per implementation.
+- Each controller **SHOULD** only manage its own status entry (matched by
+  its Gateway reference) and **MUST NOT** modify entries belonging to other
+  controllers.
+- When a Gateway is no longer associated with the InferencePool, the
+  controller **SHOULD** remove its corresponding status entry.
 
 ## Testing Tips
 

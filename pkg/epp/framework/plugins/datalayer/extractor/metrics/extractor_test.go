@@ -43,7 +43,7 @@ const (
 func TestExtractorExtract(t *testing.T) {
 	ctx := context.Background()
 
-	if _, err := NewModelServerExtractor(nil, ""); err == nil {
+	if _, err := NewCoreMetricsExtractor(nil, ""); err == nil {
 		t.Error("expected to fail to create extractor with nil registry")
 	}
 
@@ -57,7 +57,7 @@ func TestExtractorExtract(t *testing.T) {
 		t.Fatalf("failed to register mapping: %v", err)
 	}
 
-	extractor, err := NewModelServerExtractor(registry, "")
+	extractor, err := NewCoreMetricsExtractor(registry, "")
 	if err != nil {
 		t.Fatalf("failed to create extractor: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestExtractorMultiEngine(t *testing.T) {
 	mSgl, _ := NewMapping("sglang:num_queue_reqs", "sglang:num_running_reqs", "", "", "")
 	_ = registry.Register("sglang", mSgl)
 
-	extractor, _ := NewModelServerExtractor(registry, "")
+	extractor, _ := NewCoreMetricsExtractor(registry, "")
 
 	// Sample metric data
 	data := sourcemetrics.PrometheusMetricMap{
@@ -276,7 +276,7 @@ func TestBackwardCompatibility(t *testing.T) {
 	mDef, _ := NewMapping("vllm:num_requests_waiting", "", "", "", "")
 	_ = registry.Register(DefaultEngineType, mDef)
 
-	extractor, _ := NewModelServerExtractor(registry, "")
+	extractor, _ := NewCoreMetricsExtractor(registry, "")
 
 	data := sourcemetrics.PrometheusMetricMap{
 		"vllm:num_requests_waiting": &dto.MetricFamily{
@@ -306,7 +306,131 @@ func TestBackwardCompatibility(t *testing.T) {
 	}
 }
 
-func TestModelServerExtractorFactoryDefaultEngine(t *testing.T) {
+func TestCacheInfoLabelAliasing(t *testing.T) {
+	ctx := context.Background()
+
+	// SGLang uses "page_size" and "num_pages" instead of "block_size" and "num_gpu_blocks"
+	registry := NewMappingRegistry()
+	mapping, err := NewMappingFromConfig(MappingConfig{
+		Queue:               "sglang:num_queue_reqs",
+		Running:             "sglang:num_running_reqs",
+		KVUsage:             "sglang:token_usage",
+		CacheInfo:           "sglang:cache_config_info",
+		CacheBlockSizeLabel: "page_size",
+		CacheNumBlocksLabel: "num_pages",
+	})
+	if err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
+	if err := registry.Register(DefaultEngineType, mapping); err != nil {
+		t.Fatalf("failed to register mapping: %v", err)
+	}
+
+	extractor, _ := NewCoreMetricsExtractor(registry, "")
+
+	data := sourcemetrics.PrometheusMetricMap{
+		"sglang:cache_config_info": &dto.MetricFamily{
+			Type: dto.MetricType_GAUGE.Enum(),
+			Metric: []*dto.Metric{
+				{
+					Label: []*dto.LabelPair{
+						{
+							Name:  proto.String("page_size"),
+							Value: proto.String("64"),
+						},
+						{
+							Name:  proto.String("num_pages"),
+							Value: proto.String("11147"),
+						},
+					},
+					Gauge: &dto.Gauge{Value: ptr.To(1.0)},
+				},
+			},
+		},
+	}
+
+	ep := fwkdl.NewEndpoint(nil, nil)
+	_ = extractor.Extract(ctx, data, ep)
+
+	if ep.GetMetrics().CacheBlockSize != 64 {
+		t.Errorf("expected CacheBlockSize 64, got %d", ep.GetMetrics().CacheBlockSize)
+	}
+	if ep.GetMetrics().CacheNumBlocks != 11147 {
+		t.Errorf("expected CacheNumBlocks 11147, got %d", ep.GetMetrics().CacheNumBlocks)
+	}
+}
+
+func TestDirectGaugeSpecExtraction(t *testing.T) {
+	ctx := context.Background()
+
+	// Triton exposes block size and num blocks as separate gauge values
+	registry := NewMappingRegistry()
+	mapping, err := NewMappingFromConfig(MappingConfig{
+		Queue:          "nv_trt_llm_request_metrics{request_type=waiting}",
+		Running:        "nv_trt_llm_request_metrics{request_type=scheduled}",
+		KVUsage:        "nv_trt_llm_kv_cache_block_metrics{kv_cache_block_type=fraction}",
+		CacheBlockSize: "nv_trt_llm_kv_cache_block_metrics{kv_cache_block_type=tokens_per}",
+		CacheNumBlocks: "nv_trt_llm_kv_cache_block_metrics{kv_cache_block_type=max}",
+	})
+	if err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
+	if err := registry.Register(DefaultEngineType, mapping); err != nil {
+		t.Fatalf("failed to register mapping: %v", err)
+	}
+
+	extractor, _ := NewCoreMetricsExtractor(registry, "")
+
+	data := sourcemetrics.PrometheusMetricMap{
+		"nv_trt_llm_kv_cache_block_metrics": &dto.MetricFamily{
+			Type: dto.MetricType_GAUGE.Enum(),
+			Metric: []*dto.Metric{
+				{
+					Label: []*dto.LabelPair{
+						{
+							Name:  proto.String("kv_cache_block_type"),
+							Value: proto.String("tokens_per"),
+						},
+					},
+					Gauge: &dto.Gauge{Value: ptr.To(64.0)},
+				},
+				{
+					Label: []*dto.LabelPair{
+						{
+							Name:  proto.String("kv_cache_block_type"),
+							Value: proto.String("max"),
+						},
+					},
+					Gauge: &dto.Gauge{Value: ptr.To(6239.0)},
+				},
+				{
+					Label: []*dto.LabelPair{
+						{
+							Name:  proto.String("kv_cache_block_type"),
+							Value: proto.String("fraction"),
+						},
+					},
+					Gauge: &dto.Gauge{Value: ptr.To(0.42)},
+				},
+			},
+		},
+	}
+
+	ep := fwkdl.NewEndpoint(nil, nil)
+	_ = extractor.Extract(ctx, data, ep)
+
+	if ep.GetMetrics().CacheBlockSize != 64 {
+		t.Errorf("expected CacheBlockSize 64, got %d", ep.GetMetrics().CacheBlockSize)
+	}
+	if ep.GetMetrics().CacheNumBlocks != 6239 {
+		t.Errorf("expected CacheNumBlocks 6239, got %d", ep.GetMetrics().CacheNumBlocks)
+	}
+	if ep.GetMetrics().KVCacheUsagePercent != 0.42 {
+		t.Errorf("expected KVCacheUsagePercent 0.42, got %f", ep.GetMetrics().KVCacheUsagePercent)
+	}
+}
+
+func TestCoreMetricsExtractorFactoryDefaultEngine(t *testing.T) {
 	tests := []struct {
 		name         string
 		params       map[string]any
@@ -335,6 +459,14 @@ func TestModelServerExtractorFactoryDefaultEngine(t *testing.T) {
 			},
 			wantErr:      false,
 			checkDefault: "vllm",
+		},
+		{
+			name: "defaultEngine trtllm-serve",
+			params: map[string]any{
+				"defaultEngine": "trtllm-serve",
+			},
+			wantErr:      false,
+			checkDefault: "trtllm-serve",
 		},
 		{
 			name: "defaultEngine not found",
@@ -373,17 +505,25 @@ func TestModelServerExtractorFactoryDefaultEngine(t *testing.T) {
 			checkDefault: "custom",
 		},
 		{
-			name: "custom engineConfigs auto-appends vllm and sglang",
+			name: "custom engineConfigs auto-appends vllm sglang trtllm-serve and triton-tensorrt-llm",
 			params: map[string]any{
 				"engineConfigs": []map[string]any{
 					{
-						"name":               "triton",
-						"queuedRequestsSpec": "nv_trt_llm:waiting",
+						"name":               "custom-engine",
+						"queuedRequestsSpec": "custom:waiting",
 					},
 				},
 			},
 			wantErr:      false,
 			checkDefault: "vllm", // vllm is auto-appended and becomes default
+		},
+		{
+			name: "defaultEngine triton-tensorrt-llm",
+			params: map[string]any{
+				"defaultEngine": "triton-tensorrt-llm",
+			},
+			wantErr:      false,
+			checkDefault: "triton-tensorrt-llm",
 		},
 		{
 			name: "custom engineConfigs with custom vllm preserves user config",
@@ -404,7 +544,7 @@ func TestModelServerExtractorFactoryDefaultEngine(t *testing.T) {
 				"engineConfigs": []map[string]any{},
 			},
 			wantErr:      false,
-			checkDefault: "vllm", // vllm and sglang are auto-appended
+			checkDefault: "vllm", // all built-in engines are auto-appended
 		},
 		{
 			name: "defaultEngine triton with triton defined",
@@ -418,7 +558,7 @@ func TestModelServerExtractorFactoryDefaultEngine(t *testing.T) {
 				},
 			},
 			wantErr:      false,
-			checkDefault: "triton", // triton is default, vllm/sglang auto-appended
+			checkDefault: "triton", // triton is default, vllm/sglang/trtllm-serve auto-appended
 		},
 		{
 			name: "both vllm and sglang custom defined",
@@ -475,7 +615,7 @@ func TestModelServerExtractorFactoryDefaultEngine(t *testing.T) {
 				}
 			}
 
-			plugin, err := ModelServerExtractorFactory("test", params, nil)
+			plugin, err := CoreMetricsExtractorFactory("test", params, nil)
 
 			if tt.wantErr {
 				if err == nil {
